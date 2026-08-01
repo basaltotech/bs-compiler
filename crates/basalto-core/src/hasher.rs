@@ -1,7 +1,7 @@
 use blake3;
 use sha2::{Digest, Sha256};
 use serde::{Serialize, Deserialize};
-use basalto_common::hardware::{GpuIdentity, DeviceCapabilities};
+use basalto_common::hardware::{DeviceCapabilities};
 use std::sync::OnceLock;
 
 static SECRET_KEY: OnceLock<[u8; 32]> = OnceLock::new();
@@ -15,10 +15,8 @@ pub fn init_secret_key(seed: &[u8]) {
 
 fn secret_key() -> &'static [u8; 32] {
     SECRET_KEY.get_or_init(|| {
-        // Gerar a partir de /dev/urandom se não inicializado
-        use std::fs;
         let mut key = [0u8; 32];
-        if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
             use std::io::Read;
             f.read_exact(&mut key).ok();
         }
@@ -42,24 +40,23 @@ pub struct KernelMetadata {
 impl KernelMetadata {
     fn to_serialized(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        // op fixo 32 bytes
-        let mut op_b = [0u8; 32];
+        // operation: 32 bytes
+        let mut op = [0u8; 32];
         let op_bytes = self.operation.as_bytes();
         let len = op_bytes.len().min(32);
-        op_b[..len].copy_from_slice(&op_bytes[..len]);
-        buf.extend_from_slice(&op_b);
-
-        // dtype fixo 16
+        op[..len].copy_from_slice(&op_bytes[..len]);
+        buf.extend_from_slice(&op);
+        // dtype: 16 bytes
         let mut dt = [0u8; 16];
         let dt_bytes = self.dtype.as_bytes();
         let len = dt_bytes.len().min(16);
         dt[..len].copy_from_slice(&dt_bytes[..len]);
         buf.extend_from_slice(&dt);
-
         // shape
         buf.extend_from_slice(&(self.shape.len() as u64).to_le_bytes());
-        for dim in &self.shape { buf.extend_from_slice(&(*dim as u64).to_le_bytes()); }
-
+        for dim in &self.shape {
+            buf.extend_from_slice(&(*dim as u64).to_le_bytes());
+        }
         // vendor, arch, driver
         let mut v = [0u8; 16];
         let v_bytes = self.vendor.as_bytes();
@@ -76,10 +73,6 @@ impl KernelMetadata {
         let len = dv_bytes.len().min(32);
         dv[..len].copy_from_slice(&dv_bytes[..len]);
         buf.extend_from_slice(&dv);
-
-        // job_id e node_id NÃO entram na serialização (apenas para auditoria)
-        // (mantidos separadamente)
-
         // capabilities
         if let Some(caps) = &self.capabilities {
             buf.extend_from_slice(&caps.compute_capability_major.to_le_bytes());
@@ -103,7 +96,6 @@ impl KernelMetadata {
     }
 
     pub fn audit_digest(&self) -> String {
-        // Inclui job_id e node_id na auditoria
         let mut data = self.to_serialized();
         if let Some(job) = &self.job_id {
             data.extend_from_slice(job.as_bytes());
