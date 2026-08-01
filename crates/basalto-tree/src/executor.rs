@@ -178,6 +178,116 @@ impl Executor {
         Ok(())
     }
 
+    fn naive_matmul_cpu(
+        a: &[f64],
+        b: &[f64],
+        m: usize,
+        n: usize,
+        k: usize,
+        batch: usize,
+    ) -> Vec<f64> {
+        let mut c = vec![0.0; batch * m * n];
+        for b_idx in 0..batch {
+            let a_base = b_idx * m * k;
+            let b_base = b_idx * k * n;
+            let c_base = b_idx * m * n;
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0;
+                    for l in 0..k {
+                        sum += a[a_base + i * k + l] * b[b_base + l * n + j];
+                    }
+                    c[c_base + i * n + j] = sum;
+                }
+            }
+        }
+        c
+    }
+
+    fn naive_stencil_cpu(
+        input: &[f64],
+        shape: &[usize],
+        radius: usize,
+        coeffs: &[f64],
+    ) -> Vec<f64> {
+        let dims = shape.len();
+        let mut output = vec![0.0; input.len()];
+        if dims == 1 {
+            let nx = shape[0];
+            for x in 0..nx {
+                let mut sum = 0.0;
+                for dx in 0..(2 * radius + 1) {
+                    let cx = (dx as i64) - (radius as i64);
+                    let ix = x as i64 + cx;
+                    let val = if ix < 0 || ix >= nx as i64 { 0.0 } else { input[ix as usize] };
+                    sum += val * coeffs[dx];
+                }
+                output[x] = sum;
+            }
+        } else if dims == 2 {
+            let nx = shape[0];
+            let ny = shape[1];
+            for y in 0..ny {
+                for x in 0..nx {
+                    let mut sum = 0.0;
+                    let mut idx = 0;
+                    for dy in 0..(2 * radius + 1) {
+                        let cy = (dy as i64) - (radius as i64);
+                        let iy = y as i64 + cy;
+                        for dx in 0..(2 * radius + 1) {
+                            let cx = (dx as i64) - (radius as i64);
+                            let ix = x as i64 + cx;
+                            let val = if iy < 0 || iy >= ny as i64 || ix < 0 || ix >= nx as i64 {
+                                0.0
+                            } else {
+                                input[(iy * nx as i64 + ix) as usize]
+                            };
+                            sum += val * coeffs[idx];
+                            idx += 1;
+                        }
+                    }
+                    output[y * nx + x] = sum;
+                }
+            }
+        } else if dims == 3 {
+            let nx = shape[0];
+            let ny = shape[1];
+            let nz = shape[2];
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let mut sum = 0.0;
+                        let mut idx = 0;
+                        for dz in 0..(2 * radius + 1) {
+                            let cz = (dz as i64) - (radius as i64);
+                            let iz = z as i64 + cz;
+                            for dy in 0..(2 * radius + 1) {
+                                let cy = (dy as i64) - (radius as i64);
+                                let iy = y as i64 + cy;
+                                for dx in 0..(2 * radius + 1) {
+                                    let cx = (dx as i64) - (radius as i64);
+                                    let ix = x as i64 + cx;
+                                    let val = if iz < 0 || iz >= nz as i64
+                                        || iy < 0 || iy >= ny as i64
+                                        || ix < 0 || ix >= nx as i64
+                                    {
+                                        0.0
+                                    } else {
+                                        input[((iz * ny as i64 + iy) * nx as i64 + ix) as usize]
+                                    };
+                                    sum += val * coeffs[idx];
+                                    idx += 1;
+                                }
+                            }
+                        }
+                        output[((z * ny + y) * nx + x)] = sum;
+                    }
+                }
+            }
+        }
+        output
+    }
+
     pub fn validate_kernel(
         &self,
         op: &str,
@@ -196,7 +306,6 @@ impl Executor {
         let elem_size = if dtype == "f32" { 4 } else { 8 };
         let atol = 1e-5;
         let rtol = 1e-5;
-
         let result_len = match op {
             "matmul" => {
                 let m = m.ok_or_else(|| anyhow!("m não fornecido"))?;
@@ -210,7 +319,6 @@ impl Executor {
 
         let cuda = basalto_communication::CudaRuntime::new()?;
         let pinned_ptr = unsafe { cuda.malloc_host(result_len * elem_size)? };
-
         unsafe {
             cuda.memcpy(
                 pinned_ptr,
@@ -239,7 +347,93 @@ impl Executor {
                 .collect()
         };
 
-        let cpu_result: Vec<f64> = vec![0.0; result_len];
+        let cpu_result = match op {
+            "matmul" => {
+                let m = m.unwrap();
+                let n = n.unwrap();
+                let k = k.unwrap();
+                let batch = shape.first().unwrap_or(&1);
+                let a_cpu = if let Some(ptr) = a_ptr {
+                    let bytes = batch * m * k * elem_size;
+                    let mut buf = vec![0u8; bytes];
+                    unsafe {
+                        cuda.memcpy(
+                            buf.as_mut_ptr() as *mut c_void,
+                            ptr,
+                            bytes,
+                            CUDA_MEMCPY_DEVICE_TO_HOST,
+                        )?;
+                    }
+                    buf.chunks_exact(elem_size)
+                        .map(|chunk| {
+                            if dtype == "f32" {
+                                f32::from_ne_bytes(chunk.try_into().unwrap()) as f64
+                            } else {
+                                f64::from_ne_bytes(chunk.try_into().unwrap())
+                            }
+                        })
+                        .collect::<Vec<f64>>()
+                } else {
+                    vec![0.0; batch * m * k]
+                };
+                let b_cpu = if let Some(ptr) = b_ptr {
+                    let bytes = batch * k * n * elem_size;
+                    let mut buf = vec![0u8; bytes];
+                    unsafe {
+                        cuda.memcpy(
+                            buf.as_mut_ptr() as *mut c_void,
+                            ptr,
+                            bytes,
+                            CUDA_MEMCPY_DEVICE_TO_HOST,
+                        )?;
+                    }
+                    buf.chunks_exact(elem_size)
+                        .map(|chunk| {
+                            if dtype == "f32" {
+                                f32::from_ne_bytes(chunk.try_into().unwrap()) as f64
+                            } else {
+                                f64::from_ne_bytes(chunk.try_into().unwrap())
+                            }
+                        })
+                        .collect::<Vec<f64>>()
+                } else {
+                    vec![0.0; batch * k * n]
+                };
+                Self::naive_matmul_cpu(&a_cpu, &b_cpu, m, n, k, *batch)
+            }
+            "stencil_1d" | "stencil_2d" | "stencil_3d" => {
+                let input_cpu = if let Some(ptr) = input_ptr {
+                    let bytes = result_len * elem_size;
+                    let mut buf = vec![0u8; bytes];
+                    unsafe {
+                        cuda.memcpy(
+                            buf.as_mut_ptr() as *mut c_void,
+                            ptr,
+                            bytes,
+                            CUDA_MEMCPY_DEVICE_TO_HOST,
+                        )?;
+                    }
+                    buf.chunks_exact(elem_size)
+                        .map(|chunk| {
+                            if dtype == "f32" {
+                                f32::from_ne_bytes(chunk.try_into().unwrap()) as f64
+                            } else {
+                                f64::from_ne_bytes(chunk.try_into().unwrap())
+                            }
+                        })
+                        .collect::<Vec<f64>>()
+                } else {
+                    vec![0.0; result_len]
+                };
+                let r = radius.unwrap_or(1);
+                let c = coeffs.unwrap_or_else(|| {
+                    let total = (2 * r + 1).pow(shape.len() as u32);
+                    vec![1.0 / total as f64; total as usize]
+                });
+                Self::naive_stencil_cpu(&input_cpu, shape, r, &c)
+            }
+            _ => vec![0.0; result_len],
+        };
 
         for (i, (gv, cv)) in gpu_vals.iter().zip(cpu_result.iter()).enumerate() {
             let diff = (gv - cv).abs();

@@ -10,6 +10,7 @@ pub struct HaloExchanger {
     rank: i32,
     size: i32,
     gpu_aware_mpi: bool,
+    nccl_data_type: i32,
 }
 
 impl HaloExchanger {
@@ -28,6 +29,7 @@ impl HaloExchanger {
             rank,
             size,
             gpu_aware_mpi,
+            nccl_data_type: 0,
         })
     }
 
@@ -40,13 +42,27 @@ impl HaloExchanger {
     }
 
     fn detect_gpu_aware_mpi() -> bool {
-        std::env::var("MV2_USE_CUDA").map(|s| s == "1").unwrap_or(false) ||
-        std::env::var("OMPI_MCA_mpi_cuda_support").map(|s| s == "1").unwrap_or(false) ||
-        std::env::var("MPICH_GPU_SUPPORT_ENABLED").map(|s| s == "1").unwrap_or(false)
+        std::env::var("MV2_USE_CUDA").map(|s| s == "1").unwrap_or(false)
+            || std::env::var("OMPI_MCA_mpi_cuda_support").map(|s| s == "1").unwrap_or(false)
+            || std::env::var("MPICH_GPU_SUPPORT_ENABLED").map(|s| s == "1").unwrap_or(false)
+            || std::env::var("I_MPI_GPU").map(|s| s == "1").unwrap_or(false)
+    }
+
+    fn get_nccl_type(&mut self, elem_size: usize) -> i32 {
+        if self.nccl_data_type != 0 {
+            return self.nccl_data_type;
+        }
+        let dtype = match elem_size {
+            4 => 6,
+            8 => 7,
+            _ => 0,
+        };
+        self.nccl_data_type = dtype;
+        dtype
     }
 
     pub fn exchange_halo_3d(
-        &self,
+        &mut self,
         data: *mut c_void,
         nx: usize,
         ny: usize,
@@ -61,6 +77,103 @@ impl HaloExchanger {
             return Ok(());
         }
 
+        if let Some(nccl) = &self.nccl {
+            return self.exchange_halo_nccl(
+                nccl, data, nx, ny, nz,
+                halo_x, halo_y, halo_z, elem_size, stream,
+            );
+        }
+
+        self.exchange_halo_mpi_staging(
+            data, nx, ny, nz,
+            halo_x, halo_y, halo_z, elem_size,
+        )
+    }
+
+    fn exchange_halo_nccl(
+        &mut self,
+        nccl: &Arc<NcclRuntime>,
+        data: *mut c_void,
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        halo_x: usize,
+        halo_y: usize,
+        halo_z: usize,
+        elem_size: usize,
+        stream: Option<*mut c_void>,
+    ) -> Result<()> {
+        let data_u8 = data as *mut u8;
+        let dtype = self.get_nccl_type(elem_size);
+        let comm = 0;
+        let stream_ptr = stream.unwrap_or(std::ptr::null_mut());
+
+        let left_rank = (self.rank - 1 + self.size) % self.size;
+        let right_rank = (self.rank + 1) % self.size;
+        let bottom_rank = (self.rank - 1 + self.size) % self.size;
+        let top_rank = (self.rank + 1) % self.size;
+        let front_rank = (self.rank - 1 + self.size) % self.size;
+        let back_rank = (self.rank + 1) % self.size;
+
+        if halo_x > 0 {
+            let count = halo_x * ny * nz;
+            let send_right_ptr = unsafe { data_u8.add((nx - halo_x) * ny * nz * elem_size) as *const c_void };
+            let recv_left_ptr = unsafe { data_u8.add(0) as *mut c_void };
+            let send_left_ptr = unsafe { data_u8.add(0) as *const c_void };
+            let recv_right_ptr = unsafe { data_u8.add((nx - halo_x) * ny * nz * elem_size) as *mut c_void };
+
+            nccl.group_start()?;
+            nccl.send(send_right_ptr, count, dtype, right_rank, stream_ptr)?;
+            nccl.recv(recv_left_ptr, count, dtype, left_rank, stream_ptr)?;
+            nccl.send(send_left_ptr, count, dtype, left_rank, stream_ptr)?;
+            nccl.recv(recv_right_ptr, count, dtype, right_rank, stream_ptr)?;
+            nccl.group_end()?;
+        }
+
+        if halo_y > 0 && self.size > 1 {
+            let count = nx * halo_y * nz;
+            let send_top_ptr = unsafe { data_u8.add((ny - halo_y) * nx * nz * elem_size) as *const c_void };
+            let recv_bottom_ptr = unsafe { data_u8.add(0) as *mut c_void };
+            let send_bottom_ptr = unsafe { data_u8.add(0) as *const c_void };
+            let recv_top_ptr = unsafe { data_u8.add((ny - halo_y) * nx * nz * elem_size) as *mut c_void };
+
+            nccl.group_start()?;
+            nccl.send(send_top_ptr, count, dtype, top_rank, stream_ptr)?;
+            nccl.recv(recv_bottom_ptr, count, dtype, bottom_rank, stream_ptr)?;
+            nccl.send(send_bottom_ptr, count, dtype, bottom_rank, stream_ptr)?;
+            nccl.recv(recv_top_ptr, count, dtype, top_rank, stream_ptr)?;
+            nccl.group_end()?;
+        }
+
+        if halo_z > 0 && self.size > 1 {
+            let count = nx * ny * halo_z;
+            let send_back_ptr = unsafe { data_u8.add((nz - halo_z) * nx * ny * elem_size) as *const c_void };
+            let recv_front_ptr = unsafe { data_u8.add(0) as *mut c_void };
+            let send_front_ptr = unsafe { data_u8.add(0) as *const c_void };
+            let recv_back_ptr = unsafe { data_u8.add((nz - halo_z) * nx * ny * elem_size) as *mut c_void };
+
+            nccl.group_start()?;
+            nccl.send(send_back_ptr, count, dtype, back_rank, stream_ptr)?;
+            nccl.recv(recv_front_ptr, count, dtype, front_rank, stream_ptr)?;
+            nccl.send(send_front_ptr, count, dtype, front_rank, stream_ptr)?;
+            nccl.recv(recv_back_ptr, count, dtype, back_rank, stream_ptr)?;
+            nccl.group_end()?;
+        }
+
+        Ok(())
+    }
+
+    fn exchange_halo_mpi_staging(
+        &self,
+        data: *mut c_void,
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        halo_x: usize,
+        halo_y: usize,
+        halo_z: usize,
+        elem_size: usize,
+    ) -> Result<()> {
         let data_u8 = data as *mut u8;
         let left_rank = (self.rank - 1 + self.size) % self.size;
         let right_rank = (self.rank + 1) % self.size;
@@ -69,7 +182,6 @@ impl HaloExchanger {
         let front_rank = (self.rank - 1 + self.size) % self.size;
         let back_rank = (self.rank + 1) % self.size;
 
-        // Troca em X
         if halo_x > 0 {
             let halo_x_bytes = halo_x * ny * nz * elem_size;
             let send_right = self.copy_region_to_cpu(
@@ -115,7 +227,6 @@ impl HaloExchanger {
             )?;
         }
 
-        // Troca em Y
         if halo_y > 0 && self.size > 1 {
             let halo_y_bytes = nx * halo_y * nz * elem_size;
             let send_top = self.copy_region_to_cpu(
@@ -161,7 +272,6 @@ impl HaloExchanger {
             )?;
         }
 
-        // Troca em Z
         if halo_z > 0 && self.size > 1 {
             let halo_z_bytes = nx * ny * halo_z * elem_size;
             let send_back = self.copy_region_to_cpu(

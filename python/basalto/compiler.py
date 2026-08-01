@@ -19,7 +19,7 @@ def basalto_backend(gm: torch.fx.GraphModule, example_inputs):
                     nxt = nodes[j]
                     if nxt.op == "call_function":
                         tgt = str(nxt.target)
-                        if "bias" in tgt:
+                        if "bias" in tgt or "add" in tgt:
                             fused_op = "bias"
                         elif "relu" in tgt and fused_op == "bias":
                             fused_op = "bias_relu"
