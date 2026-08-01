@@ -11,11 +11,10 @@ use basalto_common::hardware::DeviceCapabilities;
 pub mod common;
 pub mod stencil_1d;
 pub mod stencil_2d;
+pub mod stencil_3d; // <-- NOVO
 
 /// Trait que todo gerador de stencil deve implementar.
 pub trait StencilGenerator {
-    /// Gera o LLVM IR para o kernel, escrevendo no módulo fornecido.
-    /// Retorna o IR como string (para depuração) ou pode retornar Ok(()) se não precisar.
     fn generate_ir(
         &self,
         module: &Module,
@@ -31,6 +30,7 @@ pub fn get_generator(dims: usize) -> Box<dyn StencilGenerator> {
     match dims {
         1 => Box::new(stencil_1d::Stencil1D),
         2 => Box::new(stencil_2d::Stencil2D),
+        3 => Box::new(stencil_3d::Stencil3D), // <-- NOVO
         _ => panic!("Dimensão {} ainda não suportada", dims),
     }
 }

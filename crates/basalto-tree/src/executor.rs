@@ -1,3 +1,4 @@
+// crates/basalto-tree/src/executor.rs
 use anyhow::{Result, anyhow};
 use std::ffi::c_void;
 use tokio::sync::mpsc;
@@ -5,6 +6,9 @@ use serde_json::Value;
 use basalto_target_nvidia::NvidiaRuntime;
 use basalto_common::hardware::GpuIdentity;
 
+// --------------------------------------------------------------------------
+// Mensagem para notificar o SiliconForge JIT (background)
+// --------------------------------------------------------------------------
 #[derive(Debug, Clone)]
 pub struct KernelExecutionReport {
     pub kernel_hash: String,
@@ -15,6 +19,9 @@ pub struct KernelExecutionReport {
     pub gpu_identity: GpuIdentity,
 }
 
+// --------------------------------------------------------------------------
+// Executor principal
+// --------------------------------------------------------------------------
 pub struct Executor {
     runtime: NvidiaRuntime,
     report_sender: Option<mpsc::Sender<KernelExecutionReport>>,
@@ -59,13 +66,16 @@ impl Executor {
     }
 }
 
+// --------------------------------------------------------------------------
+// Função auxiliar que orquestra o lançamento a partir dos parâmetros FLIR
+// --------------------------------------------------------------------------
 pub fn execute_flir_kernel(
     ptx_bytes: &[u8],
     function_name: &str,
     flir_params: &Value,
     input_device_ptrs: &[*const c_void],
     output_device_ptrs: &[*const c_void],
-    shape: &[usize],
+    shape: &[usize],                         // <-- shape completo
     kernel_hash: Option<String>,
     sender: Option<mpsc::Sender<KernelExecutionReport>>,
 ) -> Result<()> {
@@ -74,6 +84,8 @@ pub fn execute_flir_kernel(
     let tile_y = flir_params["tile_y"].as_i64().unwrap_or(1) as u32;
     let shared_mem_bytes = flir_params["shared_mem_bytes"].as_u64().unwrap_or(0) as u32;
 
+    // Calcula grid e block de acordo com a dimensionalidade
+    // Para 3D: grid e block são 2D (Z é loop no kernel)
     let (grid, block) = match dims {
         1 => {
             let n = shape[0] as u32;
@@ -90,10 +102,23 @@ pub fn execute_flir_kernel(
             let grid_y = (n_y + block_y - 1) / block_y;
             ((grid_x, grid_y, 1), (block_x, block_y, 1))
         }
+        3 => {
+            let n_x = shape[0] as u32;
+            let n_y = shape[1] as u32;
+            // Z não é usado no grid/block (é loop)
+            let block_x = tile_x.min(1024);
+            let block_y = tile_y.min(1024);
+            let grid_x = (n_x + block_x - 1) / block_x;
+            let grid_y = (n_y + block_y - 1) / block_y;
+            ((grid_x, grid_y, 1), (block_x, block_y, 1))
+        }
         _ => return Err(anyhow!("Dimensão {} não suportada", dims)),
     };
 
-    // Construir parâmetros: [x, y, Nx, Ny] para 2D
+    // Monta a lista de parâmetros do kernel:
+    // 1D: [x, y, Nx]
+    // 2D: [x, y, Nx, Ny]
+    // 3D: [x, y, Nx, Ny, Nz]
     let mut params: Vec<*const c_void> = Vec::new();
     if input_device_ptrs.is_empty() || output_device_ptrs.is_empty() {
         return Err(anyhow!("Ponteiros de entrada/saída não fornecidos"));
@@ -108,6 +133,10 @@ pub fn execute_flir_kernel(
     if dims >= 2 {
         let ny = shape[1] as i32;
         params.push(&ny as *const i32 as *const c_void);
+    }
+    if dims >= 3 {
+        let nz = shape[2] as i32;
+        params.push(&nz as *const i32 as *const c_void);
     }
 
     let executor = Executor::new(sender)?;

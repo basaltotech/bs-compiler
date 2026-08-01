@@ -35,6 +35,7 @@ pub fn build_flir(
     let radius = 1;
     let elem_size = if dtype == "f32" { 4 } else { 8 };
 
+    // Para 2D/3D, usamos tile_x e tile_y (sqrt do total)
     let (tile_x, tile_y) = if dims >= 2 {
         let t = (tile_size as f64).sqrt() as i64;
         (t, t)
@@ -42,6 +43,8 @@ pub fn build_flir(
         (tile_size, 1)
     };
 
+    // Memória compartilhada para a tile 2D (X-Y) com halo
+    // Para 3D, a shared memory guarda apenas a fatia X-Y (Z é loop)
     let shared_mem_bytes = if dims == 1 {
         ((tile_size + 2 * radius) as u32) * elem_size
     } else {
@@ -51,18 +54,24 @@ pub fn build_flir(
     let op_name = match dims {
         1 => "stencil_1d",
         2 => "stencil_2d",
-        _ => "stencil_3d",
+        3 => "stencil_3d",
+        _ => return Err(anyhow!("Dimensão {} não suportada", dims)),
     };
 
+    // Coeficientes
     let coeffs = if dims == 1 {
-        vec![0.2, 0.3, 0.5] // 1D: 3 coeficientes
-    } else {
-        // 2D: 3x3 = 9 coeficientes (placeholder)
+        vec![0.2, 0.3, 0.5] // 1D: 3 coeffs
+    } else if dims == 2 {
+        // 2D: 3x3 = 9 coeffs
         vec![
             0.1, 0.2, 0.1,
             0.2, 0.0, 0.2,
-            0.1, 0.2, 0.1
+            0.1, 0.2, 0.1,
         ]
+    } else {
+        // 3D: 3x3x3 = 27 coeffs (isotrópico simples)
+        let c = 1.0 / 27.0;
+        vec![c; 27]
     };
 
     let ops = vec![FlirOp {
