@@ -1,0 +1,16 @@
+[node]
+node_id = "benchmark-node"
+
+[cache]
+cache_dir = "/var/cache/basalto"
+max_size_mb = 5120
+
+[logging]
+level = "info"
+file = "/var/log/basalto/basalto.log"
+
+[audit]
+enabled = true
+
+[telemetry]
+energy_source = "nvml"
