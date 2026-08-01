@@ -7,6 +7,7 @@ use serde_json::Value;
 use basalto_target_nvidia::NvidiaRuntime;
 use basalto_target_nvidia::blas::{CublasRuntime, CUBLAS_OP_N, CUBLAS_OP_T};
 use basalto_common::hardware::GpuIdentity;
+use energy_telemetry::reader::{EnergyReader, AutoEnergyReader};
 use energy_telemetry::correlator::Correlator;
 use energy_telemetry::comparator::TemporalComparator;
 use siliconforge_jit::profiler::KernelExecutionRecord;
@@ -34,6 +35,9 @@ pub struct Executor {
     correlator: Arc<Correlator>,
     comparator: Arc<TemporalComparator>,
     halo_exchanger: Option<Arc<HaloExchanger>>,
+    energy_reader: AutoEnergyReader,
+    // cache para última leitura de energia (em mJ)
+    last_energy_mj: std::sync::Mutex<Option<u64>>,
 }
 
 impl Executor {
@@ -53,7 +57,21 @@ impl Executor {
             correlator,
             comparator,
             halo_exchanger,
+            energy_reader: AutoEnergyReader::auto_detect(),
+            last_energy_mj: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Lê a energia total da GPU em mJ (apenas NVML) e guarda no cache.
+    fn sample_energy_mj(&self) -> Result<u64> {
+        let nvml = match &self.energy_reader {
+            // Precisamos acessar o campo privado. Como AutoEnergyReader não expõe nvml,
+            // usamos read_energy_joules() e convertemos para mJ.
+            // Para maior precisão, melhor seria expor o método.
+        };
+        // Usamos a trait EnergyReader para obter Joules e converter para mJ.
+        let joules = self.energy_reader.read_energy_joules()?;
+        Ok((joules * 1000.0) as u64) // J → mJ
     }
 
     pub fn launch_kernel(
@@ -74,6 +92,9 @@ impl Executor {
         device_ptr_x: *mut c_void,
         device_ptr_y: *mut c_void,
     ) -> Result<()> {
+        // ================================================================
+        // 1. TROCA DE HALOS (se MPI ativo)
+        // ================================================================
         if let Some(exchanger) = &self.halo_exchanger {
             let elem_size = if dtype == "f32" || dtype == "f16" || dtype == "bf16" { 4 } else { 8 };
             let dims = shape.len();
@@ -90,7 +111,15 @@ impl Executor {
             )?;
         }
 
+        // ================================================================
+        // 2. MEDIÇÃO DE ENERGIA (ANTES)
+        // ================================================================
+        let energy_before_mj = self.sample_energy_mj().unwrap_or(0);
         let start = std::time::Instant::now();
+
+        // ================================================================
+        // 3. EXECUÇÃO DO KERNEL
+        // ================================================================
         self.runtime
             .launch(
                 ptx_binary,
@@ -101,27 +130,41 @@ impl Executor {
                 params,
             )
             .map_err(|e| anyhow!("Erro ao lançar kernel: {}", e))?;
+
         let elapsed = start.elapsed().as_micros() as u64;
 
+        // ================================================================
+        // 4. MEDIÇÃO DE ENERGIA (DEPOIS)
+        // ================================================================
+        let energy_after_mj = self.sample_energy_mj().unwrap_or(0);
+        let delta_joules = (energy_after_mj - energy_before_mj) as f64 / 1000.0; // mJ → J
+        let delta_kwh = delta_joules / 3_600_000.0;
+
+        // ================================================================
+        // 5. REGISTRO NO CORRELATOR (COUN)
+        // ================================================================
         let gpu = GpuIdentity::from_system().unwrap_or_default();
 
         if let Some(hash) = kernel_hash {
             let job_id_str = job_id.unwrap_or("unknown");
             let node_id = &gpu.node_id;
-            self.correlator.record(&hash, job_id_str, node_id, 0.0, elapsed);
+            self.correlator.record(&hash, job_id_str, node_id, delta_kwh, elapsed);
             self.comparator.record_execution(&hash, op, dtype, shape, 0);
 
             if let Some(prev_hash) = self.comparator.get_previous_execution(op, dtype, shape, &hash) {
-                if let Some((delta_kwh, delta_percent, delta_duration)) =
+                if let Some((delta_kwh_4d, delta_percent, delta_duration)) =
                     self.comparator.compute_delta(&hash, &prev_hash)
                 {
                     eprintln!(
                         "[4D] Delta: {} kWh ({:.2}%), {} us",
-                        delta_kwh, delta_percent * 100.0, delta_duration
+                        delta_kwh_4d, delta_percent * 100.0, delta_duration
                     );
                 }
             }
 
+            // ================================================================
+            // 6. ENVIA PARA O PROFILER (SILICONFORGE)
+            // ================================================================
             if let Some(sender) = &self.profiler_sender {
                 let record = KernelExecutionRecord {
                     kernel_hash: hash.clone(),
@@ -143,6 +186,9 @@ impl Executor {
             }
         }
 
+        // ================================================================
+        // 7. RELATÓRIO PARA O JIT (SE CONFIGURADO)
+        // ================================================================
         if let Some(sender) = &self.report_sender {
             if let Some(hash) = kernel_hash {
                 let report = KernelExecutionReport {
@@ -160,142 +206,106 @@ impl Executor {
         Ok(())
     }
 
-    pub fn execute_cublas(
+    // ================================================================
+    // 8. VALIDAÇÃO NUMÉRICA AUTOMÁTICA
+    // ================================================================
+    /// Executa a referência CPU e compara com o resultado GPU.
+    /// Retorna `Ok(())` se a validação passar, `Err` com detalhes se falhar.
+    pub fn validate_kernel(
         &self,
-        a_ptr: *mut c_void,
-        b_ptr: *mut c_void,
-        c_ptr: *mut c_void,
-        m: usize,
-        n: usize,
-        k: usize,
-        trans_a: bool,
-        trans_b: bool,
-        batch: usize,
+        op: &str,
         dtype: &str,
-        kernel_hash: Option<String>,
-        job_id: Option<&str>,
+        shape: &[usize],
+        gpu_result_ptr: *mut c_void,
+        // Para MatMul: precisamos também de A e B (ponteiros GPU)
+        a_ptr: Option<*mut c_void>,
+        b_ptr: Option<*mut c_void>,
+        // Para stencils: precisamos do input
+        input_ptr: Option<*mut c_void>,
+        // Parâmetros adicionais
+        m: Option<usize>,
+        n: Option<usize>,
+        k: Option<usize>,
+        radius: Option<usize>,
+        coeffs: Option<Vec<f64>>,
     ) -> Result<()> {
-        let cublas = CublasRuntime::new()
-            .map_err(|e| anyhow!("Falha ao carregar cuBLAS: {}", e))?;
-        let handle = cublas.create_handle()?;
-
-        let start = std::time::Instant::now();
-
-        let op_a = if trans_a { CUBLAS_OP_T } else { CUBLAS_OP_N };
-        let op_b = if trans_b { CUBLAS_OP_T } else { CUBLAS_OP_N };
-
-        let a_stride = m * k;
-        let b_stride = k * n;
-        let c_stride = m * n;
         let elem_size = if dtype == "f32" { 4 } else { 8 };
+        let atol = 1e-5;
+        let rtol = 1e-5;
 
+        // 1. Obter o tamanho do resultado
+        let result_len = match op {
+            "matmul" => {
+                let m = m.ok_or_else(|| anyhow!("m não fornecido"))?;
+                let n = n.ok_or_else(|| anyhow!("n não fornecido"))?;
+                let batch = shape.first().unwrap_or(&1);
+                batch * m * n
+            }
+            "stencil_1d" | "stencil_2d" | "stencil_3d" => {
+                shape.iter().product()
+            }
+            _ => return Err(anyhow!("Validação não implementada para {}", op)),
+        };
+
+        // 2. Alocar buffer na CPU para o resultado da GPU
+        let mut gpu_result_cpu = vec![0u8; result_len * elem_size];
+
+        // 3. Copiar resultado da GPU para CPU
         unsafe {
-            match dtype {
-                "f32" => {
-                    let alpha: f32 = 1.0;
-                    let beta: f32 = 0.0;
-                    for i in 0..batch {
-                        let a_offset = (a_ptr as *mut u8).add(i * a_stride * elem_size);
-                        let b_offset = (b_ptr as *mut u8).add(i * b_stride * elem_size);
-                        let c_offset = (c_ptr as *mut u8).add(i * c_stride * elem_size);
-                        let status = (cublas.cublas_sgemm)(
-                            handle,
-                            op_a, op_b,
-                            m as i32, n as i32, k as i32,
-                            &alpha,
-                            a_offset as *const c_void, m as i32,
-                            b_offset as *const c_void, k as i32,
-                            &beta,
-                            c_offset as *mut c_void, m as i32,
-                        );
-                        if status != 0 {
-                            return Err(anyhow!("cublasSgemm falhou no batch {} com status {}", i, status));
-                        }
-                    }
-                }
-                "f64" => {
-                    let alpha: f64 = 1.0;
-                    let beta: f64 = 0.0;
-                    for i in 0..batch {
-                        let a_offset = (a_ptr as *mut u8).add(i * a_stride * elem_size);
-                        let b_offset = (b_ptr as *mut u8).add(i * b_stride * elem_size);
-                        let c_offset = (c_ptr as *mut u8).add(i * c_stride * elem_size);
-                        let status = (cublas.cublas_dgemm)(
-                            handle,
-                            op_a, op_b,
-                            m as i32, n as i32, k as i32,
-                            &alpha,
-                            a_offset as *const c_void, m as i32,
-                            b_offset as *const c_void, k as i32,
-                            &beta,
-                            c_offset as *mut c_void, m as i32,
-                        );
-                        if status != 0 {
-                            return Err(anyhow!("cublasDgemm falhou no batch {} com status {}", i, status));
-                        }
-                    }
-                }
-                _ => return Err(anyhow!("Tipo de dado não suportado para cuBLAS: {}", dtype)),
+            let cuda = basalto_communication::CudaRuntime::new()?;
+            cuda.memcpy(
+                gpu_result_cpu.as_mut_ptr() as *mut c_void,
+                gpu_result_ptr,
+                gpu_result_cpu.len(),
+                basalto_communication::cuda::CUDA_MEMCPY_DEVICE_TO_HOST,
+            )?;
+        }
+
+        // 4. Executar referência na CPU
+        let cpu_result = match op {
+            "matmul" => {
+                // Implementação ingênua em CPU
+                // (Aqui usamos uma função auxiliar que não está no escopo, mas seria algo como:)
+                // naive_matmul_cpu(a_ptr_cpu, b_ptr_cpu, m, n, k, batch)
+                // Por simplicidade, retornamos erro para demonstrar a estrutura.
+                return Err(anyhow!("Validação MatMul CPU ainda não implementada"));
+            }
+            "stencil_1d" => {
+                // naive_stencil_1d_cpu(input_cpu, radius, coeffs)
+                return Err(anyhow!("Validação stencil 1D CPU ainda não implementada"));
+            }
+            _ => return Err(anyhow!("Validação não implementada para {}", op)),
+        };
+
+        // 5. Comparar elemento a elemento
+        let gpu_vals: Vec<f64> = gpu_result_cpu
+            .chunks_exact(elem_size)
+            .map(|chunk| if dtype == "f32" {
+                f32::from_ne_bytes(chunk.try_into().unwrap()) as f64
+            } else {
+                f64::from_ne_bytes(chunk.try_into().unwrap())
+            })
+            .collect();
+
+        for (i, (gpu_val, cpu_val)) in gpu_vals.iter().zip(cpu_result.iter()).enumerate() {
+            let diff = (gpu_val - cpu_val).abs();
+            let tolerance = atol + rtol * cpu_val.abs();
+            if diff > tolerance {
+                return Err(anyhow!(
+                    "Validação falhou no índice {}: GPU={:.6e}, CPU={:.6e}, diff={:.6e}, tol={:.6e}",
+                    i, gpu_val, cpu_val, diff, tolerance
+                ));
             }
         }
 
-        let elapsed = start.elapsed().as_micros() as u64;
-        let _ = cublas.destroy_handle(handle);
-
-        if let Some(hash) = kernel_hash {
-            let gpu = GpuIdentity::from_system().unwrap_or_default();
-            let job_id_str = job_id.unwrap_or("unknown");
-            self.correlator.record(&hash, job_id_str, &gpu.node_id, 0.0, elapsed);
-            self.comparator.record_execution(&hash, "matmul", &[m, k, n], 0);
-        }
-
-        Ok(())
-    }
-
-    #[cfg(feature = "cutlass")]
-    pub fn execute_fused_gemm(
-        &self,
-        a_ptr: *mut c_void,
-        b_ptr: *mut c_void,
-        c_ptr: *mut c_void,
-        m: usize,
-        n: usize,
-        k: usize,
-        trans_a: bool,
-        trans_b: bool,
-        batch: usize,
-        dtype: &str,
-        fused_op: FusedOp,
-        arch: &str,
-        kernel_hash: Option<String>,
-        job_id: Option<&str>,
-    ) -> Result<()> {
-        let start = std::time::Instant::now();
-
-        let ptx = execute_fused_gemm(
-            a_ptr, b_ptr, c_ptr,
-            m, n, k,
-            trans_a, trans_b,
-            batch,
-            dtype,
-            fused_op,
-            arch,
-        )?;
-
-        // TODO: Carregar o PTX via cuModuleLoadData e executar o kernel.
-        // Por enquanto, apenas medimos o tempo e registramos.
-        let elapsed = start.elapsed().as_micros() as u64;
-
-        if let Some(hash) = kernel_hash {
-            let gpu = GpuIdentity::from_system().unwrap_or_default();
-            let job_id_str = job_id.unwrap_or("unknown");
-            self.correlator.record(&hash, job_id_str, &gpu.node_id, 0.0, elapsed);
-            self.comparator.record_execution(&hash, "fused_gemm", &[m, k, n], 0);
-        }
-
+        eprintln!("[Validator] Validação numérica passou ({} elementos)", result_len);
         Ok(())
     }
 }
+
+// ================================================================
+// FUNÇÕES PÚBLICAS (execução de kernels)
+// ================================================================
 
 pub fn execute_flir_kernel(
     ptx_bytes: &[u8],
@@ -439,15 +449,46 @@ pub fn execute_cublas_kernel(
     job_id: Option<&str>,
 ) -> Result<()> {
     let executor = Executor::new(sender, profiler_sender, correlator, comparator, None)?;
+
+    // ================================================================
+    // MEDIÇÃO DE ENERGIA (ANTES)
+    // ================================================================
+    let energy_before_mj = executor.sample_energy_mj().unwrap_or(0);
+    let start = std::time::Instant::now();
+
+    // ================================================================
+    // EXECUÇÃO VIA CUBLAS
+    // ================================================================
     executor.execute_cublas(
         a_ptr, b_ptr, c_ptr,
         m, n, k,
         trans_a, trans_b,
         batch,
         dtype,
-        kernel_hash,
+        kernel_hash.clone(),
         job_id,
-    )
+    )?;
+
+    let elapsed = start.elapsed().as_micros() as u64;
+
+    // ================================================================
+    // MEDIÇÃO DE ENERGIA (DEPOIS)
+    // ================================================================
+    let energy_after_mj = executor.sample_energy_mj().unwrap_or(0);
+    let delta_joules = (energy_after_mj - energy_before_mj) as f64 / 1000.0;
+    let delta_kwh = delta_joules / 3_600_000.0;
+
+    // ================================================================
+    // REGISTRO NO CORRELATOR
+    // ================================================================
+    if let Some(hash) = kernel_hash {
+        let gpu = GpuIdentity::from_system().unwrap_or_default();
+        let job_id_str = job_id.unwrap_or("unknown");
+        executor.correlator.record(&hash, job_id_str, &gpu.node_id, delta_kwh, elapsed);
+        executor.comparator.record_execution(&hash, "matmul", &[m, k, n], 0);
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "cutlass")]
@@ -472,6 +513,16 @@ pub fn execute_fused_gemm_kernel(
     job_id: Option<&str>,
 ) -> Result<()> {
     let executor = Executor::new(sender, profiler_sender, correlator, comparator, None)?;
+
+    // ================================================================
+    // MEDIÇÃO DE ENERGIA (ANTES)
+    // ================================================================
+    let energy_before_mj = executor.sample_energy_mj().unwrap_or(0);
+    let start = std::time::Instant::now();
+
+    // ================================================================
+    // EXECUÇÃO VIA CUTLASS JIT
+    // ================================================================
     executor.execute_fused_gemm(
         a_ptr, b_ptr, c_ptr,
         m, n, k,
@@ -480,7 +531,25 @@ pub fn execute_fused_gemm_kernel(
         dtype,
         fused_op,
         arch,
-        kernel_hash,
+        kernel_hash.clone(),
         job_id,
-    )
+    )?;
+
+    let elapsed = start.elapsed().as_micros() as u64;
+
+    // ================================================================
+    // MEDIÇÃO DE ENERGIA (DEPOIS)
+    // ================================================================
+    let energy_after_mj = executor.sample_energy_mj().unwrap_or(0);
+    let delta_joules = (energy_after_mj - energy_before_mj) as f64 / 1000.0;
+    let delta_kwh = delta_joules / 3_600_000.0;
+
+    if let Some(hash) = kernel_hash {
+        let gpu = GpuIdentity::from_system().unwrap_or_default();
+        let job_id_str = job_id.unwrap_or("unknown");
+        executor.correlator.record(&hash, job_id_str, &gpu.node_id, delta_kwh, elapsed);
+        executor.comparator.record_execution(&hash, "fused_gemm", &[m, k, n], 0);
+    }
+
+    Ok(())
 }
