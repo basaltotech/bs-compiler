@@ -11,5 +11,6 @@ llvm-codegen = ["dep:inkwell"]
 basalto-core = { path = "../basalto-core" }
 basalto-common = { path = "../basalto-common" }
 anyhow = { workspace = true }
-
+thiserror = { workspace = true }
 inkwell = { workspace = true, optional = true }
+libloading = "0.8"

@@ -1,11 +1,15 @@
 [package]
-name = "basalto-python"
+name = "basalto-tree"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-crate-type = ["cdylib"]
-
 [dependencies]
-pyo3 = { workspace = true }
-basalto-tree = { path = "../crates/basalto-tree" }
+basalto-common = { path = "../basalto-common" }
+basalto-core = { path = "../basalto-core" }
+basalto-target-nvidia = { path = "../basalto-target-nvidia" }
+basalto-gems = { path = "../basalto-gems" }
+tokio = { workspace = true }
+serde = { workspace = true }
+bincode = "1.3"
+dirs = { workspace = true }
+pyo3 = { workspace = true, features = ["extension-module"] }
