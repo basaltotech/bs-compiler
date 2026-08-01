@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::ffi::c_void;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -25,6 +25,7 @@ pub struct Executor {
     profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
     correlator: Arc<Correlator>,
     comparator: Arc<TemporalComparator>,
+    halo_exchanger: Option<Arc<basalto_communication::halo_exchange::HaloExchanger>>,
 }
 
 impl Executor {
@@ -33,6 +34,7 @@ impl Executor {
         profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
         correlator: Arc<Correlator>,
         comparator: Arc<TemporalComparator>,
+        halo_exchanger: Option<Arc<basalto_communication::halo_exchange::HaloExchanger>>,
     ) -> Result<Self> {
         let runtime = NvidiaRuntime::new()
             .map_err(|e| anyhow!("Falha ao inicializar CUDA: {}", e))?;
@@ -42,6 +44,7 @@ impl Executor {
             profiler_sender,
             correlator,
             comparator,
+            halo_exchanger,
         })
     }
 
@@ -59,16 +62,42 @@ impl Executor {
         shape: &[usize],
         strides: &[isize],
         job_id: Option<&str>,
+        device_ptr_x: *mut c_void,
+        device_ptr_y: *mut c_void,
     ) -> Result<()> {
+        // Troca de halos entre GPUs/nós (antes do kernel)
+        if let Some(exchanger) = &self.halo_exchanger {
+            let elem_size = if dtype == "f32" || dtype == "f16" || dtype == "bf16" { 4 } else { 8 };
+            let rank = exchanger.get_rank();
+            let size = exchanger.get_size();
+            eprintln!(
+                "[Executor] Trocando halos (rank={}/{}) para shape={:?}",
+                rank, size, shape
+            );
+            exchanger.exchange_halo_3d(
+                device_ptr_x,
+                shape[0],
+                shape[1],
+                shape[2],
+                1,  // halo_x
+                1,  // halo_y
+                1,  // halo_z
+                elem_size,
+                None, // stream
+            )?;
+        }
+
         let start = std::time::Instant::now();
-        self.runtime.launch(
-            ptx_binary,
-            function_name,
-            grid_dim,
-            block_dim,
-            shared_mem_bytes,
-            params,
-        ).map_err(|e| anyhow!("Erro ao lançar kernel: {}", e))?;
+        self.runtime
+            .launch(
+                ptx_binary,
+                function_name,
+                grid_dim,
+                block_dim,
+                shared_mem_bytes,
+                params,
+            )
+            .map_err(|e| anyhow!("Erro ao lançar kernel: {}", e))?;
         let elapsed = start.elapsed().as_micros() as u64;
 
         let gpu = GpuIdentity::from_system().unwrap_or_default();
@@ -146,6 +175,9 @@ pub fn execute_flir_kernel(
     op: &str,
     dtype: &str,
     job_id: Option<&str>,
+    halo_exchanger: Option<Arc<basalto_communication::halo_exchange::HaloExchanger>>,
+    device_ptr_x: *mut c_void,
+    device_ptr_y: *mut c_void,
 ) -> Result<()> {
     let dims = shape.len();
     let tile_x = flir_params["tile_x"].as_i64().unwrap_or(128) as u32;
@@ -187,18 +219,48 @@ pub fn execute_flir_kernel(
     params.push(input_device_ptrs[0]);
     params.push(output_device_ptrs[0]);
 
-    if dims >= 1 { let nx = shape[0] as i32; params.push(&nx as *const i32 as *const c_void); }
-    if dims >= 2 { let ny = shape[1] as i32; params.push(&ny as *const i32 as *const c_void); }
-    if dims >= 3 { let nz = shape[2] as i32; params.push(&nz as *const i32 as *const c_void); }
+    if dims >= 1 {
+        let nx = shape[0] as i32;
+        params.push(&nx as *const i32 as *const c_void);
+    }
+    if dims >= 2 {
+        let ny = shape[1] as i32;
+        params.push(&ny as *const i32 as *const c_void);
+    }
+    if dims >= 3 {
+        let nz = shape[2] as i32;
+        params.push(&nz as *const i32 as *const c_void);
+    }
 
-    if dims >= 1 { let sx = strides[0] as i32; params.push(&sx as *const i32 as *const c_void); }
-    else { let sx = 1; params.push(&sx as *const i32 as *const c_void); }
-    if dims >= 2 { let sy = strides[1] as i32; params.push(&sy as *const i32 as *const c_void); }
-    else { let sy = 1; params.push(&sy as *const i32 as *const c_void); }
-    if dims >= 3 { let sz = strides[2] as i32; params.push(&sz as *const i32 as *const c_void); }
-    else { let sz = 1; params.push(&sz as *const i32 as *const c_void); }
+    if dims >= 1 {
+        let sx = strides[0] as i32;
+        params.push(&sx as *const i32 as *const c_void);
+    } else {
+        let sx = 1;
+        params.push(&sx as *const i32 as *const c_void);
+    }
+    if dims >= 2 {
+        let sy = strides[1] as i32;
+        params.push(&sy as *const i32 as *const c_void);
+    } else {
+        let sy = 1;
+        params.push(&sy as *const i32 as *const c_void);
+    }
+    if dims >= 3 {
+        let sz = strides[2] as i32;
+        params.push(&sz as *const i32 as *const c_void);
+    } else {
+        let sz = 1;
+        params.push(&sz as *const i32 as *const c_void);
+    }
 
-    let executor = Executor::new(sender, profiler_sender, correlator, comparator)?;
+    let executor = Executor::new(
+        sender,
+        profiler_sender,
+        correlator,
+        comparator,
+        halo_exchanger,
+    )?;
     executor.launch_kernel(
         ptx_bytes,
         function_name,
@@ -212,5 +274,7 @@ pub fn execute_flir_kernel(
         shape,
         strides,
         job_id,
+        device_ptr_x,
+        device_ptr_y,
     )
 }

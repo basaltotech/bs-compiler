@@ -41,6 +41,9 @@ impl SiliconForgeOptimizer {
         if let Some(s) = self.suggest_grid_optimization(profile) {
             suggestions.push(s);
         }
+        if let Some(s) = self.suggest_tensor_core(profile) {
+            suggestions.push(s);
+        }
         suggestions
     }
 
@@ -145,6 +148,29 @@ impl SiliconForgeOptimizer {
                 reason: format!(
                     "Grid muito pequeno ({}) para {} SMs – considere reduzir block size",
                     grid_x * grid_y, sm_count
+                ),
+                confidence: 0.6,
+            });
+        }
+        None
+    }
+
+    fn suggest_tensor_core(&self, profile: &KernelProfile) -> Option<OptimizationSuggestion> {
+        // Só sugere Tensor Core se o kernel for 3D, demorado e tiver tile compatível com 16x16
+        if profile.avg_duration_us > 3000.0
+            && profile.avg_block.0 >= 16.0
+            && profile.avg_block.1 >= 16.0
+            && profile.avg_grid.2 < 2.0 // Assume que grid.z == 1 (típico para loop Z)
+        {
+            return Some(OptimizationSuggestion {
+                kernel_hash: profile.kernel_hash.clone(),
+                new_tile_x: Some(64),
+                new_tile_y: Some(64),
+                new_shared_mem: None,
+                new_precision: Some("f16".to_string()),
+                reason: format!(
+                    "Ativar Tensor Cores (FP16) pode acelerar este kernel 3D (avg: {:.1}us)",
+                    profile.avg_duration_us
                 ),
                 confidence: 0.6,
             });

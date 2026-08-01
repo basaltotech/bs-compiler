@@ -1,0 +1,12 @@
+[package]
+name = "basalto-communication"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+libloading = { workspace = true }
+basalto-common = { path = "../basalto-common" }
+basalto-core = { path = "../basalto-core" }

@@ -11,7 +11,9 @@ use basalto_common::hardware::DeviceCapabilities;
 pub mod common;
 pub mod stencil_1d;
 pub mod stencil_2d;
-pub mod stencil_3d; // <-- NOVO
+pub mod stencil_3d; 
+pub mod tensor_core;
+pub mod checkpoint;
 
 /// Trait que todo gerador de stencil deve implementar.
 pub trait StencilGenerator {

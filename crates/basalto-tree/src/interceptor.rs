@@ -13,6 +13,7 @@ use energy_telemetry::correlator::Correlator;
 use energy_telemetry::comparator::TemporalComparator;
 use siliconforge_jit::{SiliconForgeProfiler, SiliconForgeOptimizer, SiliconForgeCompiler};
 use siliconforge_jit::profiler::KernelExecutionRecord;
+use basalto_communication::{MpiRuntime, NcclRuntime, halo_exchange::HaloExchanger};
 
 struct InFlightGuard {
     key: String,
@@ -38,22 +39,28 @@ pub struct BasaltoInterceptor {
     correlator: Arc<Correlator>,
     comparator: Arc<TemporalComparator>,
     profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
+    halo_exchanger: Option<Arc<HaloExchanger>>,
     _siliconforge_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BasaltoInterceptor {
-    pub fn new(
-        jit_sender: Option<mpsc::Sender<KernelExecutionReport>>,
-    ) -> Self {
+    pub fn new(jit_sender: Option<mpsc::Sender<KernelExecutionReport>>) -> Self {
         let correlator = Arc::new(Correlator::new());
         let comparator = Arc::new(TemporalComparator::new(correlator.clone()));
         let local_cache = Arc::new(LocalCache::new_with_capacity(10_000));
+
+        // --- INICIALIZAÇÃO DO MPI/NCCL ---
+        let mpi = MpiRuntime::new().ok();
+        let nccl = NcclRuntime::new().ok();
+        let halo_exchanger = mpi.map(|m| Arc::new(HaloExchanger::new(m, nccl).unwrap_or_else(|e| {
+            eprintln!("[Interceptor] Erro ao criar HaloExchanger: {}", e);
+            panic!()
+        })));
 
         // --- INICIALIZAÇÃO DO SILICONFORGE JIT ---
         let (profiler_tx, mut profiler_rx) = mpsc::channel::<KernelExecutionRecord>(10000);
         let profiler = Arc::new(SiliconForgeProfiler::new());
 
-        // Obtém capacidades da GPU
         let gpu = GpuIdentity::from_system().unwrap_or_default();
         let caps = gpu.capabilities.clone().unwrap_or(DeviceCapabilities {
             compute_capability_major: 7,
@@ -74,7 +81,6 @@ impl BasaltoInterceptor {
             gpu_identity.clone(),
         ));
 
-        // Loop de recalibração em background (executa a cada 60s)
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
             loop {
@@ -106,6 +112,7 @@ impl BasaltoInterceptor {
             correlator,
             comparator,
             profiler_sender: Some(profiler_tx),
+            halo_exchanger,
             _siliconforge_handle: Some(handle),
         }
     }
@@ -151,7 +158,6 @@ impl BasaltoInterceptor {
         let cache_key = meta.cache_key();
         eprintln!("[Interceptor] Chave cache (BLAKE3): {}", cache_key);
 
-        // Tenta cache L1
         if let Some(cached) = self.local_cache.get(&cache_key) {
             eprintln!("[Interceptor] Cache L1 HIT");
             let tile_x = cached.tile_x.unwrap_or(128);
@@ -178,11 +184,13 @@ impl BasaltoInterceptor {
                 &op,
                 &dtype,
                 job_id.as_deref(),
+                self.halo_exchanger.clone(),
+                device_ptr_x,
+                device_ptr_y,
             );
         }
         eprintln!("[Interceptor] Cache L1 MISS");
 
-        // Controle de compilações concorrentes
         let lock: Arc<Mutex<()>> = self.in_flight
             .entry(cache_key.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -213,6 +221,9 @@ impl BasaltoInterceptor {
                 &op,
                 &dtype,
                 job_id.as_deref(),
+                self.halo_exchanger.clone(),
+                device_ptr_x,
+                device_ptr_y,
             );
         }
 
@@ -236,7 +247,6 @@ impl BasaltoInterceptor {
         let ptx_bytes = compile_to_ptx(&llvm_ir, &gpu.capabilities)
             .map_err(|e| anyhow!("Falha ao compilar para PTX: {}", e))?;
 
-        // Salva no cache COM OS METADADOS
         let cached_entry = local_cache::CachedKernel {
             binary: ptx_bytes.clone(),
             target: "ptx".to_string(),
@@ -244,7 +254,7 @@ impl BasaltoInterceptor {
             tile_y: Some(tile_y),
             shared_mem_bytes,
             radius: 1,
-            metadata: Some(meta.clone()), // <-- METADADOS SALVOS
+            metadata: Some(meta.clone()),
         };
         self.local_cache.set(&cache_key, &cached_entry);
 
@@ -269,9 +279,11 @@ impl BasaltoInterceptor {
             &op,
             &dtype,
             job_id.as_deref(),
+            self.halo_exchanger.clone(),
+            device_ptr_x,
+            device_ptr_y,
         )?;
 
-        // Auditoria
         if std::env::var("BASALTO_AUDIT_ENABLED").unwrap_or_default() == "true" {
             let effective_job_id = job_id.or_else(|| {
                 std::env::var("SLURM_JOB_ID")
