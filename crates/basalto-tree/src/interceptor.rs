@@ -8,9 +8,7 @@ use basalto_common::hardware::{GpuIdentity, DeviceCapabilities};
 use basalto_core::hasher::KernelMetadata;
 use basalto_core::flir_builder::{build_flir, flir_to_llvm, compile_to_ptx};
 use basalto_tree::local_cache::{self, LocalCache};
-use basalto_tree::executor::{
-    execute_flir_kernel, execute_cublas_kernel, KernelExecutionReport,
-};
+use basalto_tree::executor::{execute_flir_kernel, execute_cublas_kernel, KernelExecutionReport};
 #[cfg(feature = "cutlass")]
 use basalto_tree::executor::execute_fused_gemm_kernel;
 #[cfg(feature = "cutlass")]
@@ -235,10 +233,8 @@ impl BasaltoInterceptor {
         device_ptr_x: *mut c_void,
         device_ptr_y: *mut c_void,
         device_ptr_z: *mut c_void,
+        custom_coeffs: Option<Vec<f64>>,
     ) -> Result<()> {
-        // ================================================================
-        // ROTEAMENTO PARA MatMul (cuBLAS ou CUTLASS JIT)
-        // ================================================================
         if op.starts_with("matmul") {
             if shape.len() != 4 {
                 return Err(anyhow!("MatMul espera shape [batch, m, k, n]"));
@@ -299,7 +295,6 @@ impl BasaltoInterceptor {
                 }
             }
 
-            // Fallback: cuBLAS
             eprintln!("[Interceptor] MatMul via cuBLAS (chave: {})", cache_key);
             return execute_cublas_kernel(
                 device_ptr_x,
@@ -318,9 +313,6 @@ impl BasaltoInterceptor {
             );
         }
 
-        // ================================================================
-        // ROTEAMENTO PARA STENCILS (FLIR -> LLVM -> PTX)
-        // ================================================================
         if shape.is_empty() || shape.len() > 3 {
             return Err(anyhow!("Apenas 1D, 2D e 3D são suportados (shape = {:?})", shape));
         }
@@ -435,8 +427,15 @@ impl BasaltoInterceptor {
 
         eprintln!("[Interceptor] Compilando do zero...");
 
-        let flir_module = build_flir("", &gpu.capabilities, &dtype, &shape, &strides, radius)
-            .map_err(|e| anyhow!("Falha ao construir FLIR: {}", e))?;
+        let flir_module = build_flir(
+            "",
+            &gpu.capabilities,
+            &dtype,
+            &shape,
+            &strides,
+            radius,
+            custom_coeffs,
+        ).map_err(|e| anyhow!("Falha ao construir FLIR: {}", e))?;
 
         let flir_op = flir_module.ops.first()
             .ok_or_else(|| anyhow!("Módulo FLIR sem operações"))?;
@@ -552,6 +551,7 @@ impl PyBasaltoInterceptor {
         device_ptr_x: usize,
         device_ptr_y: usize,
         device_ptr_z: usize,
+        custom_coeffs: Option<Vec<f64>>,
     ) -> PyResult<()> {
         let ptr_x = device_ptr_x as *mut c_void;
         let ptr_y = device_ptr_y as *mut c_void;
@@ -567,6 +567,7 @@ impl PyBasaltoInterceptor {
                 ptr_x,
                 ptr_y,
                 ptr_z,
+                custom_coeffs,
             )
         })
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))

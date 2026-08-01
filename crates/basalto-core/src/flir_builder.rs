@@ -21,14 +21,14 @@ pub struct FlirModule {
     pub output_names: Vec<String>,
 }
 
-/// Constrói o módulo FLIR. Agora recebe `radius` (largura do halo) como parâmetro.
 pub fn build_flir(
     _graph_str: &str,
     caps: &Option<DeviceCapabilities>,
     dtype: &str,
     shape: &[usize],
     strides: &[isize],
-    radius: usize, // <-- NOVO parâmetro
+    radius: usize,
+    custom_coeffs: Option<Vec<f64>>, 
 ) -> Result<FlirModule> {
     let dims = shape.len();
     let tile_size = caps.as_ref().map(|c| c.max_threads_per_block as i64).unwrap_or(128);
@@ -42,7 +42,6 @@ pub fn build_flir(
         (tile_size, 1)
     };
 
-    // Cálculo correto da memória compartilhada baseado no radius
     let shared_mem_bytes = if dims == 1 {
         ((tile_size + 2 * radius_i64) as u32) * elem_size
     } else {
@@ -56,10 +55,9 @@ pub fn build_flir(
         _ => return Err(anyhow!("Dimensão {} não suportada", dims)),
     };
 
-    // Geração automática de coeficientes para a ordem do stencil
-    // Para um stencil isotrópico, todos os coeficientes são iguais a 1/(2*radius+1)^dims
-    let coeffs = if radius == 1 && dims == 1 {
-        vec![0.2, 0.3, 0.5] // Coeficientes específicos para 1D radius=1
+    // Coeficientes: se fornecidos pelo Python, usa-os; senão, gera isotrópicos.
+    let coeffs = if let Some(coeffs) = custom_coeffs {
+        coeffs
     } else {
         let total_coeffs = (2 * radius + 1).pow(dims as u32);
         let c = 1.0 / total_coeffs as f64;
@@ -88,11 +86,7 @@ pub fn build_flir(
         })),
     }];
 
-    Ok(FlirModule {
-        ops,
-        input_names: vec!["x".to_string()],
-        output_names: vec!["y".to_string()],
-    })
+    Ok(FlirModule { ops, input_names: vec!["x".to_string()], output_names: vec!["y".to_string()] })
 }
 
 pub fn flir_to_llvm(
@@ -100,14 +94,8 @@ pub fn flir_to_llvm(
     caps: &Option<DeviceCapabilities>,
     dtype: &str,
 ) -> Result<String> {
-    let op = module
-        .ops
-        .first()
-        .ok_or_else(|| anyhow!("Nenhuma operação"))?;
-    let params = op
-        .params
-        .as_ref()
-        .ok_or_else(|| anyhow!("Sem params"))?;
+    let op = module.ops.first().ok_or_else(|| anyhow!("Nenhuma operação"))?;
+    let params = op.params.as_ref().ok_or_else(|| anyhow!("Sem params"))?;
     let dims = params["dims"].as_u64().unwrap_or(1) as usize;
 
     Target::initialize_nvptx(&InitializationConfig::default());

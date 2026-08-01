@@ -69,7 +69,7 @@ pub struct GpuIdentity {
 impl GpuIdentity {
     pub fn from_system() -> Result<Self, BasaltoError> {
         let vendor = detect_vendor();
-        let arch = detect_arch(&vendor);
+        let arch = detect_arch(&vendor)?;
         let driver_version = detect_driver_version(&vendor);
         let node_id = fs::read_to_string("/etc/hostname")
             .unwrap_or_else(|_| "unknown-node".to_string())
@@ -87,7 +87,9 @@ impl GpuIdentity {
 }
 
 fn detect_vendor() -> String {
-    if fs::metadata("/proc/driver/nvidia/version").is_ok() { return "nvidia".to_string(); }
+    if fs::metadata("/proc/driver/nvidia/version").is_ok() {
+        return "nvidia".to_string();
+    }
     if let Ok(entries) = fs::read_dir("/sys/class/drm/") {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path().join("device").join("vendor");
@@ -101,21 +103,55 @@ fn detect_vendor() -> String {
     "unknown".to_string()
 }
 
-fn detect_arch(vendor: &str) -> String {
+/// Detecta a arquitetura usando CUDA API (mais confiável) ou fallback para nvidia-smi.
+fn detect_arch(vendor: &str) -> Result<String, BasaltoError> {
     match vendor {
         "nvidia" => {
+            // Tenta via CUDA API primeiro
+            if let Some(arch) = detect_arch_via_cuda(0) {
+                return Ok(arch);
+            }
+            // Fallback: nvidia-smi
             let output = Command::new("nvidia-smi")
                 .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
                 .output()
-                .ok()?;
+                .map_err(|e| BasaltoError::Hardware(format!("nvidia-smi falhou: {}", e)))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let cleaned = stdout.trim().replace('.', "");
-            if !cleaned.is_empty() { return format!("sm_{}", cleaned); }
-            "sm_70".to_string()
+            if !cleaned.is_empty() {
+                return Ok(format!("sm_{}", cleaned));
+            }
+            Ok("sm_70".to_string())
         }
-        "amd" => "gfx90a".to_string(),
-        "intel" => "pvc".to_string(),
-        _ => "generic".to_string(),
+        "amd" => Ok("gfx90a".to_string()),
+        "intel" => Ok("pvc".to_string()),
+        _ => Ok("generic".to_string()),
+    }
+}
+
+/// Lê a compute capability diretamente via CUDA Driver API.
+fn detect_arch_via_cuda(device_index: i32) -> Option<String> {
+    unsafe {
+        let lib = Library::new("libcuda.so.1").ok()?;
+        type CuInit = unsafe extern "C" fn(u32) -> u32;
+        type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> u32;
+        type CuDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, i32) -> u32;
+
+        let cu_init: Symbol<CuInit> = lib.get(b"cuInit\0").ok()?;
+        let cu_device_get: Symbol<CuDeviceGet> = lib.get(b"cuDeviceGet\0").ok()?;
+        let cu_device_get_attr: Symbol<CuDeviceGetAttribute> = lib.get(b"cuDeviceGetAttribute\0").ok()?;
+
+        if cu_init(0) != 0 { return None; }
+        let mut device = 0;
+        if cu_device_get(&mut device, device_index) != 0 { return None; }
+
+        const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+        const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
+        let mut major = 0;
+        let mut minor = 0;
+        if cu_device_get_attr(&mut major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) != 0 { return None; }
+        if cu_device_get_attr(&mut minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) != 0 { return None; }
+        Some(format!("sm_{}{}", major, minor))
     }
 }
 
