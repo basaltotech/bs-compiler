@@ -1,0 +1,9 @@
+[package]
+name = "basalto-target-intel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+basalto-core = { path = "../basalto-core" }
+basalto-common = { path = "../basalto-common" }
+anyhow = { workspace = true }

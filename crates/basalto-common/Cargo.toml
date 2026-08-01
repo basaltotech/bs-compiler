@@ -1,0 +1,11 @@
+[package]
+name = "basalto-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+blake3 = "1.5"
+libc = "0.2"

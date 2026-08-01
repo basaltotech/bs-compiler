@@ -1,0 +1,15 @@
+[package]
+name = "basalto-target-nvidia"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+llvm-codegen = ["dep:inkwell"]
+
+[dependencies]
+basalto-core = { path = "../basalto-core" }
+basalto-common = { path = "../basalto-common" }
+anyhow = { workspace = true }
+
+inkwell = { workspace = true, optional = true }

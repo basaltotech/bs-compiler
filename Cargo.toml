@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/basalto-common",
+    "crates/basalto-core",
+    "crates/basalto-gems",
+    "crates/basalto-target-nvidia",
+    "crates/basalto-target-amd",
+    "crates/basalto-target-intel",
+    "crates/basalto-tree",
+    "crates/siliconforge-jit",
+    "crates/energy-telemetry",
+    "crates/basalto-installer",
+    "python",  # bindings PyO3
+]
+
+[workspace.dependencies]
+pyo3 = "0.23.0"
+redis = { version = "0.27.0", features = ["tokio-comp"] }
+tokio = { version = "1.42", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "1.0"
+inkwell = "0.4.0"

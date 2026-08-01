@@ -1,0 +1,21 @@
+[package]
+name = "basalto-tree"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+llvm-codegen = ["basalto-target-nvidia/llvm-codegen"]
+
+[dependencies]
+basalto-common = { path = "../basalto-common" }
+basalto-core = { path = "../basalto-core" }
+basalto-gems = { path = "../basalto-gems" }
+basalto-target-nvidia = { path = "../basalto-target-nvidia" }
+basalto-target-amd = { path = "../basalto-target-amd" }
+basalto-target-intel = { path = "../basalto-target-intel" }
+siliconforge-jit = { path = "../siliconforge-jit" }
+energy-telemetry = { path = "../energy-telemetry" }
+anyhow = { workspace = true }
+redis = { workspace = true }
+tokio = { workspace = true }
+pyo3 = { workspace = true }

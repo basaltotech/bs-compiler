@@ -1,0 +1,9 @@
+[package]
+name = "siliconforge-jit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+basalto-common = { path = "../basalto-common" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
