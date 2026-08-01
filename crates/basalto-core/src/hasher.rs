@@ -29,6 +29,7 @@ pub struct KernelMetadata {
     pub operation: String,
     pub dtype: String,
     pub shape: Vec<usize>,
+    pub strides: Vec<isize>,
     pub vendor: String,
     pub arch: String,
     pub driver_version: String,
@@ -40,40 +41,46 @@ pub struct KernelMetadata {
 impl KernelMetadata {
     fn to_serialized(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        // operation: 32 bytes
         let mut op = [0u8; 32];
         let op_bytes = self.operation.as_bytes();
         let len = op_bytes.len().min(32);
         op[..len].copy_from_slice(&op_bytes[..len]);
         buf.extend_from_slice(&op);
-        // dtype: 16 bytes
+
         let mut dt = [0u8; 16];
         let dt_bytes = self.dtype.as_bytes();
         let len = dt_bytes.len().min(16);
         dt[..len].copy_from_slice(&dt_bytes[..len]);
         buf.extend_from_slice(&dt);
-        // shape
+
         buf.extend_from_slice(&(self.shape.len() as u64).to_le_bytes());
         for dim in &self.shape {
             buf.extend_from_slice(&(*dim as u64).to_le_bytes());
         }
-        // vendor, arch, driver
+
+        buf.extend_from_slice(&(self.strides.len() as u64).to_le_bytes());
+        for stride in &self.strides {
+            buf.extend_from_slice(&(*stride as i64).to_le_bytes());
+        }
+
         let mut v = [0u8; 16];
         let v_bytes = self.vendor.as_bytes();
         let len = v_bytes.len().min(16);
         v[..len].copy_from_slice(&v_bytes[..len]);
         buf.extend_from_slice(&v);
+
         let mut a = [0u8; 16];
         let a_bytes = self.arch.as_bytes();
         let len = a_bytes.len().min(16);
         a[..len].copy_from_slice(&a_bytes[..len]);
         buf.extend_from_slice(&a);
+
         let mut dv = [0u8; 32];
         let dv_bytes = self.driver_version.as_bytes();
         let len = dv_bytes.len().min(32);
         dv[..len].copy_from_slice(&dv_bytes[..len]);
         buf.extend_from_slice(&dv);
-        // capabilities
+
         if let Some(caps) = &self.capabilities {
             buf.extend_from_slice(&caps.compute_capability_major.to_le_bytes());
             buf.extend_from_slice(&caps.compute_capability_minor.to_le_bytes());
