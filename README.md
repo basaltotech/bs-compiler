@@ -1,132 +1,196 @@
-Para um **pesquisador** (geofísico, cientista de dados, engenheiro de simulação), o foco não é instalar ou configurar o sistema, mas **usar o Basalto para acelerar seus códigos** sem se preocupar com os detalhes internos. O guia abaixo é direto, prático e evita termos técnicos desnecessários.
+# Basalto – Um compilador para o desempenho máximo de GPUs
+
+[![CI](https://github.com/basaltotech/bs-compiler/actions/workflows/ci.yml/badge.svg)](https://github.com/basaltotech/bs-compiler/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+**Basalto** é um compilador JIT (Just‑In‑Time) para GPUs que acelera simulações científicas e modelos de IA com um único código‑fonte, independente do fabricante do hardware.  
+
+Inspirado na rocha vulcânica que se forma ao resfriar rapidamente, o Basalto transforma código de alto nível em kernels nativos e otimizados para NVIDIA, AMD e Intel (atualmente com suporte completo para NVIDIA).
+
+> **Em produção no setor de óleo & gás:** O Basalto foi projetado para atender às demandas de supercomputadores como o Harpia, Pégaso e Tupi da Petrobras, reduzindo o tempo de processamento sísmico em 20–40% e permitindo a cobrança baseada em consumo real de energia (COUN – Consumo Otimizado por Unidade Normalizada).
 
 ---
 
-## 📘 Guia do Pesquisador – Basalto Enterprise Suite
+## ✨ Características
 
-Parabéns! O Basalto já está instalado no cluster. Agora você pode acelerar suas simulações sísmicas e modelos de IA com um único comando.
-
----
-
-### 1. O que o Basalto faz por você?
-
-- **Compila automaticamente** seus kernels (stencils, MatMul, atenção, etc.) para a GPU exata que você está usando.
-- **Reutiliza** o código compilado (cache) – a primeira execução é mais lenta, as seguintes são muito rápidas.
-- **Otimiza o acesso à memória** (Stride View) sem você precisar mudar seu código.
-- **Calibra em tempo real** (SiliconForge) ajustando parâmetros para melhor performance.
-- **Mede o consumo de energia** (COUN) para que você possa auditá-lo, se desejar.
+- **🖥️ Suporte multi‑fabricante:** Compila para NVIDIA (CUDA), AMD (ROCm) e Intel (OneAPI) – *hoje focado em NVIDIA*.
+- **⚙️ Compilação JIT inteligente:** Stencils 1D/2D/3D com tiling X‑Y, loop Z e memória compartilhada.
+- **🚀 MatMul otimizado:** Uso de cuBLAS (Tensor Cores) e CUTLASS JIT com fusão de bias/ReLU/GELU/Scale.
+- **🌐 Comunicação GPU‑Aware:** Troca de halos via MPI e NCCL com detecção automática de suporte a GPU‑Aware MPI.
+- **💾 Cache hierárquico:** L1 (disco local) + L2 (Redis) com LRU e serialização.
+- **📊 Telemetria de energia (COUN):** Medição precisa de kWh via NVML/IPMI/Redfish.
+- **🔁 Otimização contínua (SiliconForge JIT):** Recalibra parâmetros em background com base em métricas de execução.
+- **🧩 Stride View:** Reorganização de memória sem cópia para acesso coalescido.
+- **🔐 Instalação simplificada:** Script único `install.sh` que configura sistema, permissões e pacote Python.
 
 ---
 
-### 2. Como usar no PyTorch
+## 🏗️ Arquitetura resumida
 
-É simples: basta importar o Basalto e usar o `torch.compile` com `backend="basalto"`.
+```mermaid
+flowchart TD
+    A[Usuário] --> B[Código Python com torch.compile]
+    B --> C[Interceptor<br>basalto-tree]
+    C --> D{Decisão da operação}
+    D -->|Stencil| E[FLIR → LLVM → PTX<br>basalto-core]
+    D -->|MatMul| F[cuBLAS / CUTLASS JIT<br>basalto-target-nvidia / basalto-gemm-jit]
+    E --> G[GPU NVIDIA]
+    F --> G
+    C -.->|Métricas| H[SiliconForge JIT + Energy Telemetry]
+    H -.->|Otimização| C
+```
+
+- **`basalto-tree`** – Orquestrador principal (intercepta chamadas, gerencia cache, executa).
+- **`basalto-core`** – Núcleo do compilador (FLIR, LLVM IR, stencils).
+- **`basalto-target-nvidia`** – Backend NVIDIA (runtime CUDA, geração PTX).
+- **`basalto-communication`** – MPI/NCCL para troca de halos.
+- **`basalto-gemm-jit`** – Compilação JIT de kernels MatMul com fusão.
+- **`siliconforge-jit`** – Otimização contínua em background.
+- **`energy-telemetry`** – Medição de energia e correlação (COUN).
+
+---
+
+## 📦 Instalação
+
+### Via script único (recomendado para clusters)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/basaltotech/bs-compiler/main/deploy/installer/install.sh | sudo bash
+```
+
+Ou baixe o script manualmente:
+
+```bash
+wget https://raw.githubusercontent.com/basaltotech/bs-compiler/main/deploy/installer/install.sh
+chmod +x install.sh
+sudo ./install.sh
+```
+
+O script:
+- Baixa o binário do instalador e a wheel Python.
+- Configura permissões (udev, grupos).
+- Cria diretórios de cache, log e configuração.
+- Instala o pacote `basalto` (via pip ou em ambiente virtual).
+
+### Via pip (para desenvolvedores)
+
+```bash
+pip install git+https://github.com/basaltotech/bs-compiler.git
+```
+
+> **Pré‑requisitos:** Python 3.10+, Rust, CUDA Toolkit (>= 11.8), e as bibliotecas `libcuda.so`, `libnvrtc.so`, `libcublas.so` disponíveis no `LD_LIBRARY_PATH`.
+
+---
+
+## 🚀 Uso básico
 
 ```python
 import torch
-import basalto  # Isso já registra o backend "basalto"
+import basalto   # registra automaticamente o backend "basalto"
 
-# Sua função de simulação (exemplo: stencil 1D)
-def meu_stencil(x):
+# Exemplo de stencil 1D
+@torch.compile(backend="basalto")
+def stencil(x):
     return (x[..., :-2] + x[..., 1:-1] + x[..., 2:]) / 3.0
 
-# Compila a função para a GPU
-funcao_rapida = torch.compile(meu_stencil, backend="basalto")
-
-# Cria um tensor na GPU
-dados = torch.randn(1000000, device="cuda")
-
-# Executa – a primeira chamada compila, as seguintes são instantâneas
-resultado = funcao_rapida(dados)
+x = torch.randn(1024, device="cuda")
+y = stencil(x)   # primeira execução compila, as seguintes usam cache
 ```
-
-**Observação importante:** a primeira execução pode levar alguns segundos (é a compilação). Depois, tudo roda na velocidade máxima da GPU.
-
----
-
-### 3. Exemplo prático – Multiplicação de matrizes (muito usada em IA)
 
 ```python
-import torch
-import basalto
+# Exemplo de MatMul (usa cuBLAS automaticamente)
+@torch.compile(backend="basalto")
+def matmul(a, b):
+    return torch.matmul(a, b)
 
-def minha_rede(x, peso):
-    return torch.matmul(x, peso)
+a = torch.randn(256, 512, device="cuda")
+b = torch.randn(512, 128, device="cuda")
+c = matmul(a, b)
+```
 
-x = torch.randn(512, 1024, device="cuda")
-w = torch.randn(1024, 256, device="cuda")
+### Opções adicionais
 
-modelo_rapido = torch.compile(minha_rede, backend="basalto")
-y = modelo_rapido(x, w)  # usa cuBLAS (Tensor Cores se disponível)
+- **Cache L2 (Redis):** Edite `/etc/basalto/config.toml` e ative `[redis] enabled = true`.
+- **Auditoria (COUN):** Defina `BASALTO_AUDIT_ENABLED=true` no ambiente.
+- **Logs:** Consulte `/var/log/basalto/basalto.log`.
+
+---
+
+## 📁 Estrutura do projeto
+
+```text
+bs-compiler/
+├── crates/
+│   ├── basalto-common/          # Utilitários (hardware, permissões, config)
+│   ├── basalto-core/            # Núcleo do compilador (FLIR, LLVM, stencils)
+│   │   └── src/ir/              # Geradores de IR: 1D, 2D, 3D, Tensor Core, Checkpoint
+│   ├── basalto-target-nvidia/   # Backend NVIDIA (runtime, codegen, blas)
+│   ├── basalto-target-amd/      # Backend AMD   (stub)
+│   ├── basalto-target-intel/    # Backend Intel (stub)
+│   ├── basalto-tree/            # Orquestrador (interceptor, executor, cache)
+│   ├── basalto-communication/   # MPI, NCCL, CUDA Runtime, troca de halos
+│   ├── basalto-gemm-jit/        # MatMul JIT com CUTLASS e NVRTC
+│   ├── basalto-gems/            # Stride View (reorganização de memória)
+│   ├── siliconforge-jit/        # Otimização contínua (profiler, optimizer, compiler)
+│   ├── energy-telemetry/        # Medição de energia e correlação (COUN)
+│   └── basalto-installer/       # Instalador Rust (configuração do sistema)
+├── python/                      # Bindings PyO3 e módulo Python
+│   ├── basalto/
+│   │   ├── __init__.py
+│   │   ├── compiler.py          # Backend para torch.compile
+│   │   └── _rust.pyi            # Stubs de tipagem
+│   └── Cargo.toml
+├── deploy/installer/install.sh  # Script de instalação completo
+├── .github/workflows/           # CI/CD
+├── Cargo.toml                   # Workspace Rust
+├── pyproject.toml               # Configuração do maturin
+└── README.md                    # Este arquivo
 ```
 
 ---
 
-### 4. Exemplo para simulação sísmica (stencil 3D com halos)
+## 🔧 Desenvolvimento
 
-Se você trabalha com volumes sísmicos, o Basalto já entende stencils 3D com tiling e troca de halos.
+### Compilar do zero
 
-```python
-import torch
-import basalto
-
-def propagacao_onda(volume):
-    # Stencil 3D simples (média dos vizinhos)
-    # (aqui você coloca seu próprio stencil)
-    return (volume[..., 1:-1, 1:-1, 1:-1] +
-            volume[..., :-2, 1:-1, 1:-1] +
-            volume[..., 2:, 1:-1, 1:-1]) / 3.0
-
-volume = torch.randn(64, 64, 64, device="cuda")
-propagacao = torch.compile(propagacao_onda, backend="basalto")
-resultado = propagacao(volume)
+```bash
+git clone https://github.com/basaltotech/bs-compiler.git
+cd bs-compiler
+cargo build --release
 ```
 
-O Basalto cuida automaticamente da **troca de halos** entre GPUs se você estiver rodando em múltiplos nós (MPI).
+### Construir a wheel Python
 
----
+```bash
+maturin build --release
+pip install target/wheels/basalto-*.whl
+```
 
-### 5. Dicas de performance
+### Executar testes
 
-- **Primeira execução:** sempre será mais lenta (compilação). Use um **mini-batch** de teste para "aquecer" o cache antes do job real.
-- **Cache persistente:** os kernels compilados ficam salvos em `/var/cache/basalto/kernels/`. Se você rodar o mesmo código novamente (mesmo dias depois), ele reutiliza o binário compilado – zero overhead.
-- **Mude o tamanho dos dados:** se o tamanho dos tensores mudar, o Basalto recompila (pois a chave de cache inclui o shape). Isso é automático e transparente.
-
----
-
-### 6. O que fazer se algo não funcionar
-
-- **Verifique se o tensor está na GPU:** `x.device` deve ser `cuda`.
-- **Confira o formato:** o Basalto funciona com `float32` e `float64`; para `float16`/`bfloat16`, ele ativa Tensor Cores automaticamente.
-- **Logs:** se houver erro, o Basalto escreve mensagens no log do sistema (`/var/log/basalto/basalto.log`). Peça ajuda ao administrador para verificar.
-
----
-
-### 7. Medição de energia (COUN)
-
-Se a auditoria estiver habilitada, o Basalto registra o consumo de cada execução. Você não precisa fazer nada – o sistema já faz isso. Se quiser ver os dados:
-
-```python
-# Exemplo: acessar o correlator (avançado)
-# (normalmente isso é usado pelo time de faturamento)
+```bash
+cargo test
+python -m pytest python/tests/
 ```
 
 ---
 
-### 8. Suporte
+## 📄 Licença
 
-- Para dúvidas sobre **uso científico** (como escrever stencils eficientes), procure a equipe de suporte técnico.
-- Para **problemas de instalação ou performance**, entre em contato com a administração do cluster.
+Este projeto é distribuído sob a licença MIT. Consulte o arquivo [LICENSE](LICENSE) para mais detalhes.
 
 ---
 
-### Resumo para o pesquisador
+## 🙋 Contribuições
 
-| Ação | Comando / Procedimento |
-|------|------------------------|
-| Importar o Basalto | `import basalto` |
-| Compilar uma função | `torch.compile(minha_funcao, backend="basalto")` |
-| Rodar normalmente | A primeira execução compila; as demais são rápidas |
-| Verificar logs | Peça ajuda ao admin (logs em `/var/log/basalto/`) |
+Contribuições são bem‑vindas! Abra uma issue ou envie um pull request. Para grandes mudanças, discuta‑as primeiro através de uma issue.
 
-Agora você pode aproveitar todo o poder do hardware sem se preocupar com compiladores, otimizações ou configurações. Basta escrever seu código científico como sempre fez – o Basalto faz o resto.
+---
+
+## 📞 Contato
+
+Para dúvidas técnicas ou suporte, entre em contato com a equipe Basalto Tech.
+
+---
+
+**Basalto – a camada que une o código científico à velocidade máxima do silício.**
