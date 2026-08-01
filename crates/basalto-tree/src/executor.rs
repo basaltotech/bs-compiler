@@ -7,6 +7,7 @@ use basalto_target_nvidia::NvidiaRuntime;
 use basalto_common::hardware::GpuIdentity;
 use energy_telemetry::correlator::Correlator;
 use energy_telemetry::comparator::TemporalComparator;
+use siliconforge_jit::profiler::KernelExecutionRecord;
 
 #[derive(Debug, Clone)]
 pub struct KernelExecutionReport {
@@ -21,6 +22,7 @@ pub struct KernelExecutionReport {
 pub struct Executor {
     runtime: NvidiaRuntime,
     report_sender: Option<mpsc::Sender<KernelExecutionReport>>,
+    profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
     correlator: Arc<Correlator>,
     comparator: Arc<TemporalComparator>,
 }
@@ -28,6 +30,7 @@ pub struct Executor {
 impl Executor {
     pub fn new(
         report_sender: Option<mpsc::Sender<KernelExecutionReport>>,
+        profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
         correlator: Arc<Correlator>,
         comparator: Arc<TemporalComparator>,
     ) -> Result<Self> {
@@ -36,6 +39,7 @@ impl Executor {
         Ok(Self {
             runtime,
             report_sender,
+            profiler_sender,
             correlator,
             comparator,
         })
@@ -53,7 +57,7 @@ impl Executor {
         op: &str,
         dtype: &str,
         shape: &[usize],
-        strides: &[usize],
+        strides: &[isize],
         job_id: Option<&str>,
     ) -> Result<()> {
         let start = std::time::Instant::now();
@@ -72,6 +76,7 @@ impl Executor {
         if let Some(hash) = kernel_hash {
             let job_id_str = job_id.unwrap_or("unknown");
             let node_id = &gpu.node_id;
+
             self.correlator.record(&hash, job_id_str, node_id, 0.0, elapsed);
             self.comparator.record_execution(&hash, op, dtype, shape, 0);
 
@@ -84,6 +89,26 @@ impl Executor {
                         delta_kwh, delta_percent * 100.0, delta_duration
                     );
                 }
+            }
+
+            if let Some(sender) = &self.profiler_sender {
+                let record = KernelExecutionRecord {
+                    kernel_hash: hash.clone(),
+                    duration_us: elapsed,
+                    grid: grid_dim,
+                    block: block_dim,
+                    shared_mem_bytes,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    job_id: Some(job_id_str.to_string()),
+                    node_id: Some(node_id.clone()),
+                    gpu_vendor: gpu.vendor.clone(),
+                    gpu_arch: gpu.arch.clone(),
+                    driver_version: gpu.driver_version.clone(),
+                };
+                let _ = sender.try_send(record);
             }
         }
 
@@ -112,9 +137,10 @@ pub fn execute_flir_kernel(
     input_device_ptrs: &[*const c_void],
     output_device_ptrs: &[*const c_void],
     shape: &[usize],
-    strides: &[usize],
+    strides: &[isize],
     kernel_hash: Option<String>,
     sender: Option<mpsc::Sender<KernelExecutionReport>>,
+    profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
     correlator: Arc<Correlator>,
     comparator: Arc<TemporalComparator>,
     op: &str,
@@ -161,42 +187,18 @@ pub fn execute_flir_kernel(
     params.push(input_device_ptrs[0]);
     params.push(output_device_ptrs[0]);
 
-    if dims >= 1 {
-        let nx = shape[0] as i32;
-        params.push(&nx as *const i32 as *const c_void);
-    }
-    if dims >= 2 {
-        let ny = shape[1] as i32;
-        params.push(&ny as *const i32 as *const c_void);
-    }
-    if dims >= 3 {
-        let nz = shape[2] as i32;
-        params.push(&nz as *const i32 as *const c_void);
-    }
+    if dims >= 1 { let nx = shape[0] as i32; params.push(&nx as *const i32 as *const c_void); }
+    if dims >= 2 { let ny = shape[1] as i32; params.push(&ny as *const i32 as *const c_void); }
+    if dims >= 3 { let nz = shape[2] as i32; params.push(&nz as *const i32 as *const c_void); }
 
-    if dims >= 1 {
-        let sx = strides[0] as i32;
-        params.push(&sx as *const i32 as *const c_void);
-    } else {
-        let sx = 1;
-        params.push(&sx as *const i32 as *const c_void);
-    }
-    if dims >= 2 {
-        let sy = strides[1] as i32;
-        params.push(&sy as *const i32 as *const c_void);
-    } else {
-        let sy = 1;
-        params.push(&sy as *const i32 as *const c_void);
-    }
-    if dims >= 3 {
-        let sz = strides[2] as i32;
-        params.push(&sz as *const i32 as *const c_void);
-    } else {
-        let sz = 1;
-        params.push(&sz as *const i32 as *const c_void);
-    }
+    if dims >= 1 { let sx = strides[0] as i32; params.push(&sx as *const i32 as *const c_void); }
+    else { let sx = 1; params.push(&sx as *const i32 as *const c_void); }
+    if dims >= 2 { let sy = strides[1] as i32; params.push(&sy as *const i32 as *const c_void); }
+    else { let sy = 1; params.push(&sy as *const i32 as *const c_void); }
+    if dims >= 3 { let sz = strides[2] as i32; params.push(&sz as *const i32 as *const c_void); }
+    else { let sz = 1; params.push(&sz as *const i32 as *const c_void); }
 
-    let executor = Executor::new(sender, correlator, comparator)?;
+    let executor = Executor::new(sender, profiler_sender, correlator, comparator)?;
     executor.launch_kernel(
         ptx_bytes,
         function_name,

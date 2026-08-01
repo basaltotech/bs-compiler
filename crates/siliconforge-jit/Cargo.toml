@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-basalto-common = { path = "../basalto-common" }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dashmap = { workspace = true }
 anyhow = { workspace = true }
-tokio = { workspace = true }
+basalto-core = { path = "../basalto-core" }
+basalto-tree = { path = "../basalto-tree" }
+basalto-common = { path = "../basalto-common" }
+energy-telemetry = { path = "../energy-telemetry" }

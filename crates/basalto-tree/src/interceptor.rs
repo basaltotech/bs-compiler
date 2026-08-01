@@ -4,13 +4,15 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use dashmap::DashMap;
 
-use basalto_common::hardware::GpuIdentity;
+use basalto_common::hardware::{GpuIdentity, DeviceCapabilities};
 use basalto_core::hasher::KernelMetadata;
 use basalto_core::flir_builder::{build_flir, flir_to_llvm, compile_to_ptx};
 use basalto_tree::local_cache::{self, LocalCache};
 use basalto_tree::executor::{execute_flir_kernel, KernelExecutionReport};
 use energy_telemetry::correlator::Correlator;
 use energy_telemetry::comparator::TemporalComparator;
+use siliconforge_jit::{SiliconForgeProfiler, SiliconForgeOptimizer, SiliconForgeCompiler};
+use siliconforge_jit::profiler::KernelExecutionRecord;
 
 struct InFlightGuard {
     key: String,
@@ -30,25 +32,81 @@ impl Drop for InFlightGuard {
 }
 
 pub struct BasaltoInterceptor {
-    local_cache: LocalCache,
+    local_cache: Arc<LocalCache>,
     jit_sender: Option<mpsc::Sender<KernelExecutionReport>>,
     in_flight: Arc<DashMap<String, Arc<Mutex<()>>>>,
     correlator: Arc<Correlator>,
     comparator: Arc<TemporalComparator>,
+    profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
+    _siliconforge_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BasaltoInterceptor {
     pub fn new(
         jit_sender: Option<mpsc::Sender<KernelExecutionReport>>,
-        correlator: Arc<Correlator>,
-        comparator: Arc<TemporalComparator>,
     ) -> Self {
+        let correlator = Arc::new(Correlator::new());
+        let comparator = Arc::new(TemporalComparator::new(correlator.clone()));
+        let local_cache = Arc::new(LocalCache::new_with_capacity(10_000));
+
+        // --- INICIALIZAÇÃO DO SILICONFORGE JIT ---
+        let (profiler_tx, mut profiler_rx) = mpsc::channel::<KernelExecutionRecord>(10000);
+        let profiler = Arc::new(SiliconForgeProfiler::new());
+
+        // Obtém capacidades da GPU
+        let gpu = GpuIdentity::from_system().unwrap_or_default();
+        let caps = gpu.capabilities.clone().unwrap_or(DeviceCapabilities {
+            compute_capability_major: 7,
+            compute_capability_minor: 0,
+            max_threads_per_block: 1024,
+            max_shared_memory_per_block: 49152,
+            max_registers_per_block: 65536,
+            warp_size: 32,
+            multi_processor_count: 80,
+        });
+
+        let optimizer = Arc::new(SiliconForgeOptimizer::new(caps));
+        let gpu_identity = Arc::new(gpu);
+        let compiler = Arc::new(SiliconForgeCompiler::new(
+            profiler.clone(),
+            optimizer.clone(),
+            local_cache.clone(),
+            gpu_identity.clone(),
+        ));
+
+        // Loop de recalibração em background (executa a cada 60s)
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    Some(record) = profiler_rx.recv() => {
+                        profiler.record(record);
+                    }
+                    _ = interval.tick() => {
+                        let profiles = profiler.get_all_profiles();
+                        for profile in &profiles {
+                            let suggestions = optimizer.analyze(profile);
+                            for suggestion in suggestions {
+                                if suggestion.confidence > 0.6 {
+                                    if let Err(e) = compiler.process_suggestion(suggestion).await {
+                                        eprintln!("[SiliconForge] Erro ao aplicar otimização: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         Self {
-            local_cache: LocalCache::new_with_capacity(10_000),
+            local_cache,
             jit_sender,
             in_flight: Arc::new(DashMap::new()),
             correlator,
             comparator,
+            profiler_sender: Some(profiler_tx),
+            _siliconforge_handle: Some(handle),
         }
     }
 
@@ -93,6 +151,7 @@ impl BasaltoInterceptor {
         let cache_key = meta.cache_key();
         eprintln!("[Interceptor] Chave cache (BLAKE3): {}", cache_key);
 
+        // Tenta cache L1
         if let Some(cached) = self.local_cache.get(&cache_key) {
             eprintln!("[Interceptor] Cache L1 HIT");
             let tile_x = cached.tile_x.unwrap_or(128);
@@ -113,6 +172,7 @@ impl BasaltoInterceptor {
                 &strides,
                 Some(cache_key),
                 self.jit_sender.clone(),
+                self.profiler_sender.clone(),
                 self.correlator.clone(),
                 self.comparator.clone(),
                 &op,
@@ -122,11 +182,11 @@ impl BasaltoInterceptor {
         }
         eprintln!("[Interceptor] Cache L1 MISS");
 
+        // Controle de compilações concorrentes
         let lock: Arc<Mutex<()>> = self.in_flight
             .entry(cache_key.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-
         let _in_flight_guard = InFlightGuard::new(&self.in_flight, cache_key.clone());
         let _lock_guard = lock.lock().unwrap();
 
@@ -147,6 +207,7 @@ impl BasaltoInterceptor {
                 &strides,
                 Some(cache_key),
                 self.jit_sender.clone(),
+                self.profiler_sender.clone(),
                 self.correlator.clone(),
                 self.comparator.clone(),
                 &op,
@@ -175,6 +236,7 @@ impl BasaltoInterceptor {
         let ptx_bytes = compile_to_ptx(&llvm_ir, &gpu.capabilities)
             .map_err(|e| anyhow!("Falha ao compilar para PTX: {}", e))?;
 
+        // Salva no cache COM OS METADADOS
         let cached_entry = local_cache::CachedKernel {
             binary: ptx_bytes.clone(),
             target: "ptx".to_string(),
@@ -182,6 +244,7 @@ impl BasaltoInterceptor {
             tile_y: Some(tile_y),
             shared_mem_bytes,
             radius: 1,
+            metadata: Some(meta.clone()), // <-- METADADOS SALVOS
         };
         self.local_cache.set(&cache_key, &cached_entry);
 
@@ -200,6 +263,7 @@ impl BasaltoInterceptor {
             &strides,
             Some(cache_key),
             self.jit_sender.clone(),
+            self.profiler_sender.clone(),
             self.correlator.clone(),
             self.comparator.clone(),
             &op,
@@ -207,6 +271,7 @@ impl BasaltoInterceptor {
             job_id.as_deref(),
         )?;
 
+        // Auditoria
         if std::env::var("BASALTO_AUDIT_ENABLED").unwrap_or_default() == "true" {
             let effective_job_id = job_id.or_else(|| {
                 std::env::var("SLURM_JOB_ID")
@@ -214,7 +279,6 @@ impl BasaltoInterceptor {
                     .or_else(|_| std::env::var("LSB_JOBID"))
                     .ok()
             });
-
             let audit_meta = KernelMetadata {
                 operation: op,
                 dtype,
@@ -246,10 +310,8 @@ pub struct PyBasaltoInterceptor {
 impl PyBasaltoInterceptor {
     #[new]
     pub fn new() -> Self {
-        let correlator = Arc::new(Correlator::new());
-        let comparator = Arc::new(TemporalComparator::new(correlator.clone()));
         let sender: Option<mpsc::Sender<KernelExecutionReport>> = None;
-        let inner = BasaltoInterceptor::new(sender, correlator, comparator);
+        let inner = BasaltoInterceptor::new(sender);
         Self { inner }
     }
 
