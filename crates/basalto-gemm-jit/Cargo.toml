@@ -1,0 +1,15 @@
+[package]
+name = "basalto-gemm-jit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+libloading = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+basalto-common = { path = "../basalto-common" }
+basalto-core = { path = "../basalto-core" }
+
+[features]
+default = []

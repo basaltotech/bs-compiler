@@ -12,6 +12,11 @@ use energy_telemetry::comparator::TemporalComparator;
 use siliconforge_jit::profiler::KernelExecutionRecord;
 use basalto_communication::HaloExchanger;
 
+#[cfg(feature = "cutlass")]
+use basalto_gemm_jit::fused_kernel::execute_fused_gemm;
+#[cfg(feature = "cutlass")]
+use basalto_gemm_jit::cutlass::FusedOp;
+
 #[derive(Debug, Clone)]
 pub struct KernelExecutionReport {
     pub kernel_hash: String,
@@ -246,6 +251,50 @@ impl Executor {
 
         Ok(())
     }
+
+    #[cfg(feature = "cutlass")]
+    pub fn execute_fused_gemm(
+        &self,
+        a_ptr: *mut c_void,
+        b_ptr: *mut c_void,
+        c_ptr: *mut c_void,
+        m: usize,
+        n: usize,
+        k: usize,
+        trans_a: bool,
+        trans_b: bool,
+        batch: usize,
+        dtype: &str,
+        fused_op: FusedOp,
+        arch: &str,
+        kernel_hash: Option<String>,
+        job_id: Option<&str>,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+
+        let ptx = execute_fused_gemm(
+            a_ptr, b_ptr, c_ptr,
+            m, n, k,
+            trans_a, trans_b,
+            batch,
+            dtype,
+            fused_op,
+            arch,
+        )?;
+
+        // TODO: Carregar o PTX via cuModuleLoadData e executar o kernel.
+        // Por enquanto, apenas medimos o tempo e registramos.
+        let elapsed = start.elapsed().as_micros() as u64;
+
+        if let Some(hash) = kernel_hash {
+            let gpu = GpuIdentity::from_system().unwrap_or_default();
+            let job_id_str = job_id.unwrap_or("unknown");
+            self.correlator.record(&hash, job_id_str, &gpu.node_id, 0.0, elapsed);
+            self.comparator.record_execution(&hash, "fused_gemm", &[m, k, n], 0);
+        }
+
+        Ok(())
+    }
 }
 
 pub fn execute_flir_kernel(
@@ -396,6 +445,41 @@ pub fn execute_cublas_kernel(
         trans_a, trans_b,
         batch,
         dtype,
+        kernel_hash,
+        job_id,
+    )
+}
+
+#[cfg(feature = "cutlass")]
+pub fn execute_fused_gemm_kernel(
+    a_ptr: *mut c_void,
+    b_ptr: *mut c_void,
+    c_ptr: *mut c_void,
+    m: usize,
+    n: usize,
+    k: usize,
+    trans_a: bool,
+    trans_b: bool,
+    batch: usize,
+    dtype: &str,
+    fused_op: FusedOp,
+    arch: &str,
+    kernel_hash: Option<String>,
+    sender: Option<mpsc::Sender<KernelExecutionReport>>,
+    profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
+    correlator: Arc<Correlator>,
+    comparator: Arc<TemporalComparator>,
+    job_id: Option<&str>,
+) -> Result<()> {
+    let executor = Executor::new(sender, profiler_sender, correlator, comparator, None)?;
+    executor.execute_fused_gemm(
+        a_ptr, b_ptr, c_ptr,
+        m, n, k,
+        trans_a, trans_b,
+        batch,
+        dtype,
+        fused_op,
+        arch,
         kernel_hash,
         job_id,
     )

@@ -8,7 +8,13 @@ use basalto_common::hardware::{GpuIdentity, DeviceCapabilities};
 use basalto_core::hasher::KernelMetadata;
 use basalto_core::flir_builder::{build_flir, flir_to_llvm, compile_to_ptx};
 use basalto_tree::local_cache::{self, LocalCache};
-use basalto_tree::executor::{execute_flir_kernel, execute_cublas_kernel, KernelExecutionReport};
+use basalto_tree::executor::{
+    execute_flir_kernel, execute_cublas_kernel, KernelExecutionReport,
+};
+#[cfg(feature = "cutlass")]
+use basalto_tree::executor::execute_fused_gemm_kernel;
+#[cfg(feature = "cutlass")]
+use basalto_gemm_jit::cutlass::FusedOp;
 use energy_telemetry::correlator::Correlator;
 use energy_telemetry::comparator::TemporalComparator;
 use siliconforge_jit::{SiliconForgeProfiler, SiliconForgeOptimizer, SiliconForgeCompiler};
@@ -200,6 +206,25 @@ impl BasaltoInterceptor {
         1
     }
 
+    #[cfg(feature = "cutlass")]
+    fn detect_fused_op(op: &str) -> Option<FusedOp> {
+        if op.contains("bias") && op.contains("relu") {
+            Some(FusedOp::BiasRelu)
+        } else if op.contains("bias") && op.contains("gelu") {
+            Some(FusedOp::BiasGelu)
+        } else if op.contains("bias") {
+            Some(FusedOp::Bias)
+        } else if op.contains("relu") {
+            Some(FusedOp::Relu)
+        } else if op.contains("gelu") {
+            Some(FusedOp::Gelu)
+        } else if op.contains("scale") {
+            Some(FusedOp::Scale)
+        } else {
+            None
+        }
+    }
+
     pub fn compile_and_execute(
         &self,
         op: String,
@@ -211,7 +236,10 @@ impl BasaltoInterceptor {
         device_ptr_y: *mut c_void,
         device_ptr_z: *mut c_void,
     ) -> Result<()> {
-        if op == "matmul" {
+        // ================================================================
+        // ROTEAMENTO PARA MatMul (cuBLAS ou CUTLASS JIT)
+        // ================================================================
+        if op.starts_with("matmul") {
             if shape.len() != 4 {
                 return Err(anyhow!("MatMul espera shape [batch, m, k, n]"));
             }
@@ -224,6 +252,7 @@ impl BasaltoInterceptor {
 
             let gpu = GpuIdentity::from_system()
                 .map_err(|e| anyhow!("Falha ao detectar GPU: {}", e))?;
+            let arch = gpu.arch.clone();
 
             let meta = KernelMetadata {
                 operation: op.clone(),
@@ -238,15 +267,40 @@ impl BasaltoInterceptor {
                 matmul_trans_b: Some(trans_b),
                 matmul_batch: Some(batch),
                 vendor: gpu.vendor.clone(),
-                arch: gpu.arch.clone(),
+                arch: arch.clone(),
                 driver_version: gpu.driver_version.clone(),
                 job_id: None,
                 node_id: None,
                 capabilities: gpu.capabilities.clone(),
             };
             let cache_key = meta.cache_key();
-            eprintln!("[Interceptor] MatMul via cuBLAS (chave: {})", cache_key);
 
+            #[cfg(feature = "cutlass")]
+            {
+                if let Some(fused_op) = Self::detect_fused_op(&op) {
+                    eprintln!("[Interceptor] MatMul fundido via CUTLASS JIT (chave: {})", cache_key);
+                    return execute_fused_gemm_kernel(
+                        device_ptr_x,
+                        device_ptr_z,
+                        device_ptr_y,
+                        m, n, k,
+                        trans_a, trans_b,
+                        batch,
+                        &dtype,
+                        fused_op,
+                        &arch,
+                        Some(cache_key),
+                        self.jit_sender.clone(),
+                        self.profiler_sender.clone(),
+                        self.correlator.clone(),
+                        self.comparator.clone(),
+                        job_id.as_deref(),
+                    );
+                }
+            }
+
+            // Fallback: cuBLAS
+            eprintln!("[Interceptor] MatMul via cuBLAS (chave: {})", cache_key);
             return execute_cublas_kernel(
                 device_ptr_x,
                 device_ptr_z,
@@ -264,6 +318,9 @@ impl BasaltoInterceptor {
             );
         }
 
+        // ================================================================
+        // ROTEAMENTO PARA STENCILS (FLIR -> LLVM -> PTX)
+        // ================================================================
         if shape.is_empty() || shape.len() > 3 {
             return Err(anyhow!("Apenas 1D, 2D e 3D são suportados (shape = {:?})", shape));
         }
