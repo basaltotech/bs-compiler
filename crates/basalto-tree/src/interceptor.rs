@@ -52,10 +52,12 @@ impl BasaltoInterceptor {
         // --- INICIALIZAÇÃO DO MPI/NCCL ---
         let mpi = MpiRuntime::new().ok();
         let nccl = NcclRuntime::new().ok();
-        let halo_exchanger = mpi.map(|m| Arc::new(HaloExchanger::new(m, nccl).unwrap_or_else(|e| {
-            eprintln!("[Interceptor] Erro ao criar HaloExchanger: {}", e);
-            panic!()
-        })));
+        let halo_exchanger = mpi.map(|m| {
+            Arc::new(HaloExchanger::new(m, nccl).unwrap_or_else(|e| {
+                eprintln!("[Interceptor] Erro ao criar HaloExchanger: {}", e);
+                panic!()
+            }))
+        });
 
         // --- INICIALIZAÇÃO DO SILICONFORGE JIT ---
         let (profiler_tx, mut profiler_rx) = mpsc::channel::<KernelExecutionRecord>(10000);
@@ -117,6 +119,19 @@ impl BasaltoInterceptor {
         }
     }
 
+    /// Extrai o `radius` da operação. Exemplo: "stencil_3d_r4" -> radius=4
+    fn extract_radius(op: &str) -> usize {
+        if let Some(r) = op.split("_r").nth(1) {
+            if let Ok(radius) = r.parse::<usize>() {
+                return radius;
+            }
+        }
+        // Fallback: se a operação tiver "order_8", radius=4; "order_12", radius=6
+        if op.contains("order_8") { return 4; }
+        if op.contains("order_12") { return 6; }
+        1 // padrão: 2ª ordem (radius=1)
+    }
+
     pub fn compile_and_execute(
         &self,
         op: String,
@@ -137,6 +152,10 @@ impl BasaltoInterceptor {
             return Err(anyhow!("Ponteiros de dispositivo nulos"));
         }
 
+        // Extrai o radius da operação
+        let radius = Self::extract_radius(&op);
+        eprintln!("[Interceptor] Radius detectado: {} (ordem {})", radius, 2 * radius);
+
         let gpu = GpuIdentity::from_system()
             .map_err(|e| anyhow!("Falha ao detectar GPU: {}", e))?;
         eprintln!("[Interceptor] GPU: vendor={}, arch={}, driver={}",
@@ -147,6 +166,7 @@ impl BasaltoInterceptor {
             dtype: dtype.clone(),
             shape: shape.clone(),
             strides: strides.clone(),
+            radius, // <-- radius incluído nos metadados
             vendor: gpu.vendor.clone(),
             arch: gpu.arch.clone(),
             driver_version: gpu.driver_version.clone(),
@@ -176,6 +196,7 @@ impl BasaltoInterceptor {
                 &[device_ptr_y as *const c_void],
                 &shape,
                 &strides,
+                radius, // <-- radius passado para o executor
                 Some(cache_key),
                 self.jit_sender.clone(),
                 self.profiler_sender.clone(),
@@ -213,6 +234,7 @@ impl BasaltoInterceptor {
                 &[device_ptr_y as *const c_void],
                 &shape,
                 &strides,
+                radius,
                 Some(cache_key),
                 self.jit_sender.clone(),
                 self.profiler_sender.clone(),
@@ -229,7 +251,7 @@ impl BasaltoInterceptor {
 
         eprintln!("[Interceptor] Compilando do zero...");
 
-        let flir_module = build_flir("", &gpu.capabilities, &dtype, &shape, &strides)
+        let flir_module = build_flir("", &gpu.capabilities, &dtype, &shape, &strides, radius)
             .map_err(|e| anyhow!("Falha ao construir FLIR: {}", e))?;
 
         let flir_op = flir_module.ops.first()
@@ -253,7 +275,7 @@ impl BasaltoInterceptor {
             tile_x: Some(tile_x),
             tile_y: Some(tile_y),
             shared_mem_bytes,
-            radius: 1,
+            radius: radius as u32,
             metadata: Some(meta.clone()),
         };
         self.local_cache.set(&cache_key, &cached_entry);
@@ -271,6 +293,7 @@ impl BasaltoInterceptor {
             &[device_ptr_y as *const c_void],
             &shape,
             &strides,
+            radius,
             Some(cache_key),
             self.jit_sender.clone(),
             self.profiler_sender.clone(),
@@ -296,6 +319,7 @@ impl BasaltoInterceptor {
                 dtype,
                 shape: shape.clone(),
                 strides: strides.clone(),
+                radius,
                 vendor: gpu.vendor.clone(),
                 arch: gpu.arch.clone(),
                 driver_version: gpu.driver_version.clone(),

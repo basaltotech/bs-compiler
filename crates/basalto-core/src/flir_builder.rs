@@ -21,17 +21,19 @@ pub struct FlirModule {
     pub output_names: Vec<String>,
 }
 
+/// Constrói o módulo FLIR. Agora recebe `radius` (largura do halo) como parâmetro.
 pub fn build_flir(
     _graph_str: &str,
     caps: &Option<DeviceCapabilities>,
     dtype: &str,
     shape: &[usize],
     strides: &[isize],
+    radius: usize, // <-- NOVO parâmetro
 ) -> Result<FlirModule> {
     let dims = shape.len();
     let tile_size = caps.as_ref().map(|c| c.max_threads_per_block as i64).unwrap_or(128);
-    let radius = 1;
     let elem_size = if dtype == "f32" || dtype == "f16" || dtype == "bf16" { 4 } else { 8 };
+    let radius_i64 = radius as i64;
 
     let (tile_x, tile_y) = if dims >= 2 {
         let t = (tile_size as f64).sqrt() as i64;
@@ -40,26 +42,28 @@ pub fn build_flir(
         (tile_size, 1)
     };
 
+    // Cálculo correto da memória compartilhada baseado no radius
     let shared_mem_bytes = if dims == 1 {
-        ((tile_size + 2 * radius) as u32) * elem_size
+        ((tile_size + 2 * radius_i64) as u32) * elem_size
     } else {
-        ((tile_x + 2 * radius) * (tile_y + 2 * radius)) as u32 * elem_size
+        ((tile_x + 2 * radius_i64) * (tile_y + 2 * radius_i64)) as u32 * elem_size
     };
 
     let op_name = match dims {
-        1 => "stencil_1d",
-        2 => "stencil_2d",
-        3 => "stencil_3d",
+        1 => format!("stencil_1d_r{}", radius),
+        2 => format!("stencil_2d_r{}", radius),
+        3 => format!("stencil_3d_r{}", radius),
         _ => return Err(anyhow!("Dimensão {} não suportada", dims)),
     };
 
-    let coeffs = if dims == 1 {
-        vec![0.2, 0.3, 0.5]
-    } else if dims == 2 {
-        vec![0.1, 0.2, 0.1, 0.2, 0.0, 0.2, 0.1, 0.2, 0.1]
+    // Geração automática de coeficientes para a ordem do stencil
+    // Para um stencil isotrópico, todos os coeficientes são iguais a 1/(2*radius+1)^dims
+    let coeffs = if radius == 1 && dims == 1 {
+        vec![0.2, 0.3, 0.5] // Coeficientes específicos para 1D radius=1
     } else {
-        let c = 1.0 / 27.0;
-        vec![c; 27]
+        let total_coeffs = (2 * radius + 1).pow(dims as u32);
+        let c = 1.0 / total_coeffs as f64;
+        vec![c; total_coeffs as usize]
     };
 
     let stride_x = if dims >= 1 { strides[0] as i64 } else { 1 };
@@ -67,7 +71,7 @@ pub fn build_flir(
     let stride_z = if dims >= 3 { strides[2] as i64 } else { 1 };
 
     let ops = vec![FlirOp {
-        op: op_name.to_string(),
+        op: op_name,
         inputs: vec!["x".to_string()],
         output: "y".to_string(),
         params: Some(serde_json::json!({
@@ -111,12 +115,11 @@ pub fn flir_to_llvm(
     let llvm_module = context.create_module("basalto_kernel");
     llvm_module.set_triple(&TargetTriple::create("nvptx64-nvidia-cuda"));
 
-    // DECISÃO: Se for 3D e dtype for FP16/BF16, usa Tensor Core
     let use_tensor_core = dims == 3 && (dtype == "f16" || dtype == "bf16");
 
     let generator: Box<dyn StencilGenerator> = if use_tensor_core {
         eprintln!("[FLIR] Usando Tensor Core para 3D com dtype={}", dtype);
-        Box::new(crate::ir::tensor_core::Stencil3DTensorCore)
+        Box::new(Stencil3DTensorCore)
     } else {
         get_generator(dims)
     };

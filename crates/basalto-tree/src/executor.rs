@@ -61,6 +61,7 @@ impl Executor {
         dtype: &str,
         shape: &[usize],
         strides: &[isize],
+        radius: usize, // <-- NOVO: largura do halo
         job_id: Option<&str>,
         device_ptr_x: *mut c_void,
         device_ptr_y: *mut c_void,
@@ -70,18 +71,19 @@ impl Executor {
             let elem_size = if dtype == "f32" || dtype == "f16" || dtype == "bf16" { 4 } else { 8 };
             let rank = exchanger.get_rank();
             let size = exchanger.get_size();
+            let dims = shape.len();
             eprintln!(
-                "[Executor] Trocando halos (rank={}/{}) para shape={:?}",
-                rank, size, shape
+                "[Executor] Trocando halos (rank={}/{}) para shape={:?}, radius={}",
+                rank, size, shape, radius
             );
             exchanger.exchange_halo_3d(
                 device_ptr_x,
                 shape[0],
-                shape[1],
-                shape[2],
-                1,  // halo_x
-                1,  // halo_y
-                1,  // halo_z
+                if dims >= 2 { shape[1] } else { 1 },
+                if dims >= 3 { shape[2] } else { 1 },
+                radius, // halo_x
+                if dims >= 2 { radius } else { 0 },
+                if dims >= 3 { radius } else { 0 },
                 elem_size,
                 None, // stream
             )?;
@@ -167,6 +169,7 @@ pub fn execute_flir_kernel(
     output_device_ptrs: &[*const c_void],
     shape: &[usize],
     strides: &[isize],
+    radius: usize, // <-- NOVO: largura do halo
     kernel_hash: Option<String>,
     sender: Option<mpsc::Sender<KernelExecutionReport>>,
     profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
@@ -273,6 +276,7 @@ pub fn execute_flir_kernel(
         dtype,
         shape,
         strides,
+        radius,
         job_id,
         device_ptr_x,
         device_ptr_y,
