@@ -5,8 +5,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
-tokio = { workspace = true }
-serde = { workspace = true }
 libloading = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
 basalto-common = { path = "../basalto-common" }
-basalto-core = { path = "../basalto-core" }
+
+[features]
+default = []
+gpu_aware = [] 

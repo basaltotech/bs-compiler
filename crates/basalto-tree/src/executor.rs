@@ -8,6 +8,7 @@ use basalto_common::hardware::GpuIdentity;
 use energy_telemetry::correlator::Correlator;
 use energy_telemetry::comparator::TemporalComparator;
 use siliconforge_jit::profiler::KernelExecutionRecord;
+use basalto_communication::HaloExchanger;
 
 #[derive(Debug, Clone)]
 pub struct KernelExecutionReport {
@@ -25,7 +26,7 @@ pub struct Executor {
     profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
     correlator: Arc<Correlator>,
     comparator: Arc<TemporalComparator>,
-    halo_exchanger: Option<Arc<basalto_communication::halo_exchange::HaloExchanger>>,
+    halo_exchanger: Option<Arc<HaloExchanger>>,
 }
 
 impl Executor {
@@ -34,7 +35,7 @@ impl Executor {
         profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
         correlator: Arc<Correlator>,
         comparator: Arc<TemporalComparator>,
-        halo_exchanger: Option<Arc<basalto_communication::halo_exchange::HaloExchanger>>,
+        halo_exchanger: Option<Arc<HaloExchanger>>,
     ) -> Result<Self> {
         let runtime = NvidiaRuntime::new()
             .map_err(|e| anyhow!("Falha ao inicializar CUDA: {}", e))?;
@@ -61,34 +62,41 @@ impl Executor {
         dtype: &str,
         shape: &[usize],
         strides: &[isize],
-        radius: usize, // <-- NOVO: largura do halo
+        radius: usize,
         job_id: Option<&str>,
         device_ptr_x: *mut c_void,
         device_ptr_y: *mut c_void,
     ) -> Result<()> {
-        // Troca de halos entre GPUs/nós (antes do kernel)
+        // ================================================================
+        // TROCA DE HALOS (antes do kernel)
+        // ================================================================
         if let Some(exchanger) = &self.halo_exchanger {
             let elem_size = if dtype == "f32" || dtype == "f16" || dtype == "bf16" { 4 } else { 8 };
+            let dims = shape.len();
             let rank = exchanger.get_rank();
             let size = exchanger.get_size();
-            let dims = shape.len();
+
             eprintln!(
-                "[Executor] Trocando halos (rank={}/{}) para shape={:?}, radius={}",
+                "[Executor] Trocando halos (rank={}/{}) shape={:?}, radius={}",
                 rank, size, shape, radius
             );
+
             exchanger.exchange_halo_3d(
                 device_ptr_x,
                 shape[0],
                 if dims >= 2 { shape[1] } else { 1 },
                 if dims >= 3 { shape[2] } else { 1 },
-                radius, // halo_x
+                radius,
                 if dims >= 2 { radius } else { 0 },
                 if dims >= 3 { radius } else { 0 },
                 elem_size,
-                None, // stream
+                None,
             )?;
         }
 
+        // ================================================================
+        // EXECUÇÃO DO KERNEL
+        // ================================================================
         let start = std::time::Instant::now();
         self.runtime
             .launch(
@@ -169,7 +177,7 @@ pub fn execute_flir_kernel(
     output_device_ptrs: &[*const c_void],
     shape: &[usize],
     strides: &[isize],
-    radius: usize, // <-- NOVO: largura do halo
+    radius: usize,
     kernel_hash: Option<String>,
     sender: Option<mpsc::Sender<KernelExecutionReport>>,
     profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
@@ -178,7 +186,7 @@ pub fn execute_flir_kernel(
     op: &str,
     dtype: &str,
     job_id: Option<&str>,
-    halo_exchanger: Option<Arc<basalto_communication::halo_exchange::HaloExchanger>>,
+    halo_exchanger: Option<Arc<HaloExchanger>>,
     device_ptr_x: *mut c_void,
     device_ptr_y: *mut c_void,
 ) -> Result<()> {
@@ -264,6 +272,7 @@ pub fn execute_flir_kernel(
         comparator,
         halo_exchanger,
     )?;
+
     executor.launch_kernel(
         ptx_bytes,
         function_name,

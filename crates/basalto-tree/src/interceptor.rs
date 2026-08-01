@@ -13,7 +13,7 @@ use energy_telemetry::correlator::Correlator;
 use energy_telemetry::comparator::TemporalComparator;
 use siliconforge_jit::{SiliconForgeProfiler, SiliconForgeOptimizer, SiliconForgeCompiler};
 use siliconforge_jit::profiler::KernelExecutionRecord;
-use basalto_communication::{MpiRuntime, NcclRuntime, halo_exchange::HaloExchanger};
+use basalto_communication::{MpiRuntime, NcclRuntime, CudaRuntime, HaloExchanger};
 
 struct InFlightGuard {
     key: String,
@@ -49,17 +49,91 @@ impl BasaltoInterceptor {
         let comparator = Arc::new(TemporalComparator::new(correlator.clone()));
         let local_cache = Arc::new(LocalCache::new_with_capacity(10_000));
 
-        // --- INICIALIZAÇÃO DO MPI/NCCL ---
-        let mpi = MpiRuntime::new().ok();
-        let nccl = NcclRuntime::new().ok();
-        let halo_exchanger = mpi.map(|m| {
-            Arc::new(HaloExchanger::new(m, nccl).unwrap_or_else(|e| {
-                eprintln!("[Interceptor] Erro ao criar HaloExchanger: {}", e);
-                panic!()
-            }))
-        });
+        // ================================================================
+        // INICIALIZAÇÃO DO MPI / NCCL / CUDA PARA TROCA DE HALOS
+        // ================================================================
+        let mpi = match MpiRuntime::new() {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                eprintln!("[Interceptor] MPI não disponível: {}", e);
+                // Retorna um interceptor sem suporte a comunicação (modo single-node)
+                let (profiler_tx, _) = mpsc::channel(1);
+                let profiler = Arc::new(SiliconForgeProfiler::new());
+                let gpu = GpuIdentity::from_system().unwrap_or_default();
+                let caps = gpu.capabilities.clone().unwrap_or(DeviceCapabilities {
+                    compute_capability_major: 7,
+                    compute_capability_minor: 0,
+                    max_threads_per_block: 1024,
+                    max_shared_memory_per_block: 49152,
+                    max_registers_per_block: 65536,
+                    warp_size: 32,
+                    multi_processor_count: 80,
+                });
+                let optimizer = Arc::new(SiliconForgeOptimizer::new(caps));
+                let gpu_identity = Arc::new(gpu);
+                let compiler = Arc::new(SiliconForgeCompiler::new(
+                    profiler.clone(),
+                    optimizer.clone(),
+                    local_cache.clone(),
+                    gpu_identity.clone(),
+                ));
+                let handle = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                        let profiles = profiler.get_all_profiles();
+                        for profile in &profiles {
+                            let suggestions = optimizer.analyze(profile);
+                            for suggestion in suggestions {
+                                if suggestion.confidence > 0.6 {
+                                    if let Err(e) = compiler.process_suggestion(suggestion).await {
+                                        eprintln!("[SiliconForge] Erro ao aplicar otimização: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                return Self {
+                    local_cache,
+                    jit_sender,
+                    in_flight: Arc::new(DashMap::new()),
+                    correlator,
+                    comparator,
+                    profiler_sender: Some(profiler_tx),
+                    halo_exchanger: None,
+                    _siliconforge_handle: Some(handle),
+                };
+            }
+        };
 
-        // --- INICIALIZAÇÃO DO SILICONFORGE JIT ---
+        let nccl = match NcclRuntime::new() {
+            Ok(n) => Some(Arc::new(n)),
+            Err(e) => {
+                eprintln!("[Interceptor] NCCL não disponível: {}", e);
+                None
+            }
+        };
+
+        let cuda = match CudaRuntime::new() {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                eprintln!("[Interceptor] CUDA Runtime não disponível: {}", e);
+                panic!("CUDA Runtime é obrigatória para troca de halos");
+            }
+        };
+
+        let halo_exchanger = match HaloExchanger::new(mpi, nccl, cuda) {
+            Ok(h) => Some(Arc::new(h)),
+            Err(e) => {
+                eprintln!("[Interceptor] Erro ao criar HaloExchanger: {}", e);
+                None
+            }
+        };
+
+        // ================================================================
+        // INICIALIZAÇÃO DO SILICONFORGE JIT
+        // ================================================================
         let (profiler_tx, mut profiler_rx) = mpsc::channel::<KernelExecutionRecord>(10000);
         let profiler = Arc::new(SiliconForgeProfiler::new());
 
@@ -126,10 +200,9 @@ impl BasaltoInterceptor {
                 return radius;
             }
         }
-        // Fallback: se a operação tiver "order_8", radius=4; "order_12", radius=6
         if op.contains("order_8") { return 4; }
         if op.contains("order_12") { return 6; }
-        1 // padrão: 2ª ordem (radius=1)
+        1
     }
 
     pub fn compile_and_execute(
@@ -152,7 +225,6 @@ impl BasaltoInterceptor {
             return Err(anyhow!("Ponteiros de dispositivo nulos"));
         }
 
-        // Extrai o radius da operação
         let radius = Self::extract_radius(&op);
         eprintln!("[Interceptor] Radius detectado: {} (ordem {})", radius, 2 * radius);
 
@@ -166,7 +238,7 @@ impl BasaltoInterceptor {
             dtype: dtype.clone(),
             shape: shape.clone(),
             strides: strides.clone(),
-            radius, // <-- radius incluído nos metadados
+            radius,
             vendor: gpu.vendor.clone(),
             arch: gpu.arch.clone(),
             driver_version: gpu.driver_version.clone(),
@@ -196,7 +268,7 @@ impl BasaltoInterceptor {
                 &[device_ptr_y as *const c_void],
                 &shape,
                 &strides,
-                radius, // <-- radius passado para o executor
+                radius,
                 Some(cache_key),
                 self.jit_sender.clone(),
                 self.profiler_sender.clone(),
