@@ -15,6 +15,7 @@ basalto-target-amd = { path = "../basalto-target-amd" }
 basalto-target-intel = { path = "../basalto-target-intel" }
 siliconforge-jit = { path = "../siliconforge-jit" }
 energy-telemetry = { path = "../energy-telemetry" }
+otel = ["dep:opentelemetry", "dep:opentelemetry-otlp"]
 anyhow = { workspace = true }
 redis = { workspace = true }
 tokio = { workspace = true }

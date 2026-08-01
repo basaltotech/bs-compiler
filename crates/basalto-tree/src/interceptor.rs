@@ -253,16 +253,19 @@ impl BasaltoInterceptor {
         let output_ptrs = vec![device_ptr_y as *const c_void];
 
         // Dispara o kernel via executor (usa o runtime CUDA)
+        let correlator = Arc::new(Correlator::new());
         execute_flir_kernel(
-            ptx_bytes,
-            "basalto_kernel",
-            &flir_params,
-            &input_ptrs,
-            &output_ptrs,
-            n,
-            kernel_hash.clone(),
-            self.jit_sender.clone(),
-        )?;
+        &ptx_bytes,
+        "basalto_kernel",
+        &flir_params,
+        &input_ptrs,
+        &output_ptrs,
+        n,
+        Some(cache_key.clone()),
+        job_id.clone(),
+        self.jit_sender.clone(),
+        correlator,
+    )?;
 
         // ------------------------------------------------------------------
         // Auditoria (SHA‑256) – se habilitada
