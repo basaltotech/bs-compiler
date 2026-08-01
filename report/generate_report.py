@@ -1,65 +1,67 @@
-"""Gera relatório em Markdown a partir dos resultados JSON."""
-
 import argparse
 import json
-from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Arquivo JSON de resultados")
-    parser.add_argument("--output", default="report.md", help="Arquivo de saída (Markdown)")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", default="report.md")
     args = parser.parse_args()
 
     with open(args.input) as f:
         data = json.load(f)
 
-    output = []
-    output.append("# Basalto Benchmark Report\n")
-    output.append(f"**Data:** {data['timestamp']}\n")
-    output.append("## Sistema\n")
+    lines = []
+    lines.append("# Basalto Benchmark Report\n")
+    lines.append(f"**Data:** {data['timestamp']}\n")
+    lines.append("## Sistema\n")
     for k, v in data["system_info"].items():
-        output.append(f"- **{k}:** {v}")
-    output.append("\n")
+        lines.append(f"- **{k}:** {v}")
+    lines.append("\n")
 
     if "stencil" in data["benchmarks"]:
-        output.append("## Stencils\n")
+        lines.append("## Stencils\n")
         for name, results in data["benchmarks"]["stencil"].items():
-            output.append(f"### {name}\n")
-            output.append("| Backend | Tempo (ms) | Speedup vs Inductor |\n")
-            output.append("|---------|------------|---------------------|\n")
-            basalto_time = results.get("basalto")
-            inductor_time = results.get("inductor")
-            if basalto_time and inductor_time:
-                speedup = inductor_time / basalto_time if basalto_time > 0 else 0
-                output.append(f"| Basalto | {basalto_time:.2f} | {speedup:.2f}x |\n")
-                output.append(f"| Inductor | {inductor_time:.2f} | 1.00x |\n")
-            else:
-                output.append("| Basalto | N/A | N/A |\n")
-                output.append("| Inductor | N/A | N/A |\n")
-            output.append("\n")
+            lines.append(f"### {name}\n")
+            lines.append("| Backend | Tempo (ms) | Corrigido? | Energia (J) |\n")
+            lines.append("|---------|------------|------------|-------------|\n")
+            for backend, res in results.items():
+                if "error" in res:
+                    lines.append(f"| {backend} | Erro | - | - |\n")
+                else:
+                    time_ms = res.get("time_ms", "N/A")
+                    correct = "✅" if res.get("correct", False) else "❌"
+                    energy = f"{res.get('energy_joules', 'N/A'):.2f}" if res.get('energy_joules') else "N/A"
+                    lines.append(f"| {backend} | {time_ms:.2f} | {correct} | {energy} |\n")
+            lines.append("\n")
 
     if "matmul" in data["benchmarks"]:
-        output.append("## MatMul\n")
+        lines.append("## MatMul\n")
         for name, results in data["benchmarks"]["matmul"].items():
-            output.append(f"### {name}\n")
-            output.append("| Backend | Tempo (ms) | Speedup vs Eager |\n")
-            output.append("|---------|------------|------------------|\n")
-            for backend in ["basalto", "inductor", "eager"]:
-                t = results.get(backend)
-                if t:
-                    eager_t = results.get("eager", 1)
-                    speedup = eager_t / t if t > 0 else 0
-                    output.append(f"| {backend.capitalize()} | {t:.2f} | {speedup:.2f}x |\n")
+            lines.append(f"### {name}\n")
+            lines.append("| Backend | Tempo (ms) | Corrigido? |\n")
+            lines.append("|---------|------------|------------|\n")
+            for backend, res in results.items():
+                if "error" in res:
+                    lines.append(f"| {backend} | Erro | - |\n")
                 else:
-                    output.append(f"| {backend.capitalize()} | N/A | N/A |\n")
-            output.append("\n")
+                    time_ms = res.get("time_ms", "N/A")
+                    correct = "✅" if res.get("correct", False) else "❌"
+                    lines.append(f"| {backend} | {time_ms:.2f} | {correct} |\n")
+            lines.append("\n")
 
     if "energy" in data["benchmarks"]:
-        output.append("## Energia\n")
-        output.append("Consumo registrado pelo Basalto: verifique os logs em `/var/log/basalto/basalto.log`.\n")
+        lines.append("## Energia\n")
+        res = data["benchmarks"]["energy"]
+        if "error" in res:
+            lines.append(f"Erro: {res['error']}\n")
+        else:
+            lines.append(f"- **Energia consumida:** {res.get('energy_joules', 'N/A')} J\n")
+            lines.append(f"- **Tempo:** {res.get('time_sec', 'N/A'):.2f} s\n")
+            lines.append(f"- **Iterações:** {res.get('iterations', 'N/A')}\n")
+            lines.append(f"- **Corrigido:** {'✅' if res.get('correct', False) else '❌'}\n")
 
     with open(args.output, "w") as f:
-        f.writelines(output)
+        f.writelines(lines)
     print(f"Relatório gerado: {args.output}")
 
 if __name__ == "__main__":

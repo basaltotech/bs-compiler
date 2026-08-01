@@ -1,7 +1,9 @@
-"""Teste de medição de energia do Basalto."""
-
 import torch
 import time
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.metrics import get_energy_joules
 
 def stencil_3d(x):
     return (x[..., 1:-1, 1:-1, 1:-1] * 0.125 +
@@ -17,18 +19,36 @@ def run():
     shape = (128, 128, 128)
     dtype = torch.float32
     x = torch.randn(shape, dtype=dtype, device=device)
+
     compiled = torch.compile(stencil_3d, backend="basalto")
-    # warmup
     for _ in range(5):
-        compiled(x)
+        _ = compiled(x)
     torch.cuda.synchronize()
-    # medir energia
-    # (o Basalto já registra no correlator; este teste apenas verifica se há erro)
-    try:
-        import basalto
-        # Tenta obter o correlator (se disponível)
-        # (na prática, o relatório usará os dados do /var/log/basalto)
-        print("Medição de energia ativa (verifique logs para kWh).")
-        return {"status": "success", "message": "Energia registrada no sistema."}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+
+    energy_before = get_energy_joules()
+    start = time.perf_counter()
+    for _ in range(100):
+        _ = compiled(x)
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    energy_after = get_energy_joules()
+
+    if energy_before is not None and energy_after is not None:
+        energy_used = energy_after - energy_before
+    else:
+        energy_used = None
+
+    eager_out = stencil_3d(x)
+    compiled_out = compiled(x)
+    is_close = torch.allclose(compiled_out, eager_out, atol=1e-5, rtol=1e-5)
+
+    return {
+        "energy_joules": energy_used,
+        "time_sec": elapsed,
+        "correct": is_close,
+        "iterations": 100
+    }
+
+if __name__ == "__main__":
+    res = run()
+    print(res)

@@ -1,23 +1,38 @@
-"""Benchmark de MatMul denso e fundido."""
-
 import torch
 import time
+from typing import Dict, Any
 
 def matmul_fn(a, b):
     return torch.matmul(a, b)
 
-def benchmark_matmul(m, n, k, dtype, backend, device, repeats=20):
+def benchmark_matmul(m: int, n: int, k: int, dtype: torch.dtype,
+                     device: str, backend: str, repeats: int = 20) -> Dict[str, Any]:
     a = torch.randn(m, k, dtype=dtype, device=device)
     b = torch.randn(k, n, dtype=dtype, device=device)
-    compiled = torch.compile(matmul_fn, backend=backend)
-    for _ in range(3):
-        compiled(a, b)
+    if backend == "eager":
+        fn = matmul_fn
+    else:
+        fn = torch.compile(matmul_fn, backend=backend)
+
+    for _ in range(5):
+        _ = fn(a, b)
     torch.cuda.synchronize()
+
     start = time.perf_counter()
     for _ in range(repeats):
-        compiled(a, b)
+        _ = fn(a, b)
     torch.cuda.synchronize()
-    return (time.perf_counter() - start) / repeats * 1000
+    elapsed = (time.perf_counter() - start) / repeats * 1000
+
+    eager_out = matmul_fn(a, b)
+    compiled_out = fn(a, b)
+    is_close = torch.allclose(compiled_out, eager_out, atol=1e-5, rtol=1e-5)
+
+    return {
+        "backend": backend,
+        "time_ms": elapsed,
+        "correct": is_close
+    }
 
 def run():
     device = "cuda"
@@ -34,13 +49,13 @@ def run():
             key = f"{m}x{n}x{k}_{dtype}".replace("torch.", "")
             results[key] = {}
             for backend in ["basalto", "inductor", "eager"]:
-                if backend == "eager":
-                    fn = matmul_fn
-                else:
-                    fn = torch.compile(matmul_fn, backend=backend)
                 try:
-                    t = benchmark_matmul(m, n, k, dtype, backend, device)
-                    results[key][backend] = t
+                    res = benchmark_matmul(m, n, k, dtype, device, backend)
+                    results[key][backend] = res
                 except Exception as e:
-                    results[key][backend] = None
+                    results[key][backend] = {"error": str(e)}
     return results
+
+if __name__ == "__main__":
+    res = run()
+    print(res)

@@ -1,8 +1,6 @@
-"""Coleta de métricas do sistema e GPU."""
-
 import subprocess
-import json
 import torch
+import os
 
 def collect_system_info():
     info = {
@@ -12,3 +10,20 @@ def collect_system_info():
         "torch_version": torch.__version__,
     }
     return info
+
+def get_energy_joules():
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        energy_mj = pynvml.nvmlDeviceGetTotalEnergyConsumption(handle)
+        return energy_mj / 1000.0
+    except:
+        try:
+            out = subprocess.check_output(
+                "nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits",
+                shell=True, text=True
+            )
+            return None
+        except:
+            return None
