@@ -3,20 +3,17 @@ name = "basalto-tree"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-llvm-codegen = ["basalto-target-nvidia/llvm-codegen"]
-
 [dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+lru = { workspace = true }
+dashmap = { workspace = true }
+tokio = { workspace = true }
+pyo3 = { workspace = true, features = ["extension-module"] }
 basalto-common = { path = "../basalto-common" }
 basalto-core = { path = "../basalto-core" }
 basalto-gems = { path = "../basalto-gems" }
 basalto-target-nvidia = { path = "../basalto-target-nvidia" }
-basalto-target-amd = { path = "../basalto-target-amd" }
-basalto-target-intel = { path = "../basalto-target-intel" }
-siliconforge-jit = { path = "../siliconforge-jit" }
 energy-telemetry = { path = "../energy-telemetry" }
-otel = ["dep:opentelemetry", "dep:opentelemetry-otlp"]
-anyhow = { workspace = true }
-redis = { workspace = true }
-tokio = { workspace = true }
-pyo3 = { workspace = true }
