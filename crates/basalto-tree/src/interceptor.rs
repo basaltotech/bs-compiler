@@ -1,4 +1,3 @@
-// crates/basalto-tree/src/interceptor.rs
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -10,10 +9,9 @@ use basalto_core::hasher::KernelMetadata;
 use basalto_core::flir_builder::{build_flir, flir_to_llvm, compile_to_ptx};
 use basalto_tree::local_cache::{self, LocalCache};
 use basalto_tree::executor::{execute_flir_kernel, KernelExecutionReport};
+use energy_telemetry::correlator::Correlator;
+use energy_telemetry::comparator::TemporalComparator;
 
-// --------------------------------------------------------------------------
-// Guard RAII para remover a entrada do mapa de compilações em andamento
-// --------------------------------------------------------------------------
 struct InFlightGuard {
     key: String,
     map: Arc<DashMap<String, Arc<Mutex<()>>>>,
@@ -31,25 +29,29 @@ impl Drop for InFlightGuard {
     }
 }
 
-// --------------------------------------------------------------------------
-// Interceptor principal
-// --------------------------------------------------------------------------
 pub struct BasaltoInterceptor {
     local_cache: LocalCache,
     jit_sender: Option<mpsc::Sender<KernelExecutionReport>>,
     in_flight: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    correlator: Arc<Correlator>,
+    comparator: Arc<TemporalComparator>,
 }
 
 impl BasaltoInterceptor {
-    pub fn new(jit_sender: Option<mpsc::Sender<KernelExecutionReport>>) -> Self {
+    pub fn new(
+        jit_sender: Option<mpsc::Sender<KernelExecutionReport>>,
+        correlator: Arc<Correlator>,
+        comparator: Arc<TemporalComparator>,
+    ) -> Self {
         Self {
             local_cache: LocalCache::new_with_capacity(10_000),
             jit_sender,
             in_flight: Arc::new(DashMap::new()),
+            correlator,
+            comparator,
         }
     }
 
-    /// Ponto de entrada principal — chamado pelo executor do Rust.
     pub fn compile_and_execute(
         &self,
         op: String,
@@ -59,9 +61,6 @@ impl BasaltoInterceptor {
         device_ptr_x: *mut c_void,
         device_ptr_y: *mut c_void,
     ) -> Result<()> {
-        // ------------------------------------------------------------------
-        // 1. Validações de entrada (1D, 2D ou 3D)
-        // ------------------------------------------------------------------
         if shape.is_empty() || shape.len() > 3 {
             return Err(anyhow!("Apenas 1D, 2D e 3D são suportados (shape = {:?})", shape));
         }
@@ -69,17 +68,11 @@ impl BasaltoInterceptor {
             return Err(anyhow!("Ponteiros de dispositivo nulos"));
         }
 
-        // ------------------------------------------------------------------
-        // 2. Coletar identidade da GPU
-        // ------------------------------------------------------------------
         let gpu = GpuIdentity::from_system()
             .map_err(|e| anyhow!("Falha ao detectar GPU: {}", e))?;
         eprintln!("[Interceptor] GPU: vendor={}, arch={}, driver={}",
             gpu.vendor, gpu.arch, gpu.driver_version);
 
-        // ------------------------------------------------------------------
-        // 3. Metadados para chave de cache (NÃO inclui job_id/node_id)
-        // ------------------------------------------------------------------
         let meta = KernelMetadata {
             operation: op.clone(),
             dtype: dtype.clone(),
@@ -95,9 +88,6 @@ impl BasaltoInterceptor {
         let cache_key = meta.cache_key();
         eprintln!("[Interceptor] Chave cache (BLAKE3): {}", cache_key);
 
-        // ------------------------------------------------------------------
-        // 4. Tentar cache L1 (LRU)
-        // ------------------------------------------------------------------
         if let Some(cached) = self.local_cache.get(&cache_key) {
             eprintln!("[Interceptor] Cache L1 HIT");
             let tile_x = cached.tile_x.unwrap_or(128);
@@ -117,17 +107,15 @@ impl BasaltoInterceptor {
                 &shape,
                 Some(cache_key),
                 self.jit_sender.clone(),
+                self.correlator.clone(),
+                self.comparator.clone(),
+                &op,
+                &dtype,
+                job_id.as_deref(),
             );
         }
         eprintln!("[Interceptor] Cache L1 MISS");
 
-        // ------------------------------------------------------------------
-        // 5. (Opcional) Cache L2 (Redis) – ainda não implementado
-        // ------------------------------------------------------------------
-
-        // ------------------------------------------------------------------
-        // 6. Controle de compilações concorrentes (anti-thundering-herd)
-        // ------------------------------------------------------------------
         let lock: Arc<Mutex<()>> = self.in_flight
             .entry(cache_key.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -152,12 +140,14 @@ impl BasaltoInterceptor {
                 &shape,
                 Some(cache_key),
                 self.jit_sender.clone(),
+                self.correlator.clone(),
+                self.comparator.clone(),
+                &op,
+                &dtype,
+                job_id.as_deref(),
             );
         }
 
-        // ------------------------------------------------------------------
-        // 7. Compilação do zero
-        // ------------------------------------------------------------------
         eprintln!("[Interceptor] Compilando do zero...");
 
         let flir_module = build_flir("", &gpu.capabilities, &dtype, &shape)
@@ -188,9 +178,6 @@ impl BasaltoInterceptor {
         };
         self.local_cache.set(&cache_key, &cached_entry);
 
-        // ------------------------------------------------------------------
-        // 8. Executar o kernel
-        // ------------------------------------------------------------------
         let flir_params_for_exec = serde_json::json!({
             "tile_x": tile_x,
             "tile_y": tile_y,
@@ -205,11 +192,13 @@ impl BasaltoInterceptor {
             &shape,
             Some(cache_key),
             self.jit_sender.clone(),
+            self.correlator.clone(),
+            self.comparator.clone(),
+            &op,
+            &dtype,
+            job_id.as_deref(),
         )?;
 
-        // ------------------------------------------------------------------
-        // 9. Auditoria (SHA‑256)
-        // ------------------------------------------------------------------
         if std::env::var("BASALTO_AUDIT_ENABLED").unwrap_or_default() == "true" {
             let effective_job_id = job_id.or_else(|| {
                 std::env::var("SLURM_JOB_ID")
@@ -237,9 +226,6 @@ impl BasaltoInterceptor {
     }
 }
 
-// --------------------------------------------------------------------------
-// Bindings PyO3
-// --------------------------------------------------------------------------
 use pyo3::prelude::*;
 
 #[pyclass]
@@ -251,8 +237,10 @@ pub struct PyBasaltoInterceptor {
 impl PyBasaltoInterceptor {
     #[new]
     pub fn new() -> Self {
+        let correlator = Arc::new(Correlator::new());
+        let comparator = Arc::new(TemporalComparator::new(correlator.clone()));
         let sender: Option<mpsc::Sender<KernelExecutionReport>> = None;
-        let inner = BasaltoInterceptor::new(sender);
+        let inner = BasaltoInterceptor::new(sender, correlator, comparator);
         Self { inner }
     }
 

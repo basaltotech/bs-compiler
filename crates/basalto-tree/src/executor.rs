@@ -1,14 +1,13 @@
-// crates/basalto-tree/src/executor.rs
 use anyhow::{Result, anyhow};
 use std::ffi::c_void;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use serde_json::Value;
 use basalto_target_nvidia::NvidiaRuntime;
 use basalto_common::hardware::GpuIdentity;
+use energy_telemetry::correlator::Correlator;
+use energy_telemetry::comparator::TemporalComparator;
 
-// --------------------------------------------------------------------------
-// Mensagem para notificar o SiliconForge JIT (background)
-// --------------------------------------------------------------------------
 #[derive(Debug, Clone)]
 pub struct KernelExecutionReport {
     pub kernel_hash: String,
@@ -19,19 +18,27 @@ pub struct KernelExecutionReport {
     pub gpu_identity: GpuIdentity,
 }
 
-// --------------------------------------------------------------------------
-// Executor principal
-// --------------------------------------------------------------------------
 pub struct Executor {
     runtime: NvidiaRuntime,
     report_sender: Option<mpsc::Sender<KernelExecutionReport>>,
+    correlator: Arc<Correlator>,
+    comparator: Arc<TemporalComparator>,
 }
 
 impl Executor {
-    pub fn new(report_sender: Option<mpsc::Sender<KernelExecutionReport>>) -> Result<Self> {
+    pub fn new(
+        report_sender: Option<mpsc::Sender<KernelExecutionReport>>,
+        correlator: Arc<Correlator>,
+        comparator: Arc<TemporalComparator>,
+    ) -> Result<Self> {
         let runtime = NvidiaRuntime::new()
             .map_err(|e| anyhow!("Falha ao inicializar CUDA: {}", e))?;
-        Ok(Self { runtime, report_sender })
+        Ok(Self {
+            runtime,
+            report_sender,
+            correlator,
+            comparator,
+        })
     }
 
     pub fn launch_kernel(
@@ -43,14 +50,44 @@ impl Executor {
         shared_mem_bytes: u32,
         params: &[*const c_void],
         kernel_hash: Option<String>,
+        op: &str,
+        dtype: &str,
+        shape: &[usize],
+        job_id: Option<&str>,
     ) -> Result<()> {
         let start = std::time::Instant::now();
-        self.runtime.launch(ptx_binary, function_name, grid_dim, block_dim, shared_mem_bytes, params)
-            .map_err(|e| anyhow!("Erro ao lançar kernel: {}", e))?;
+        self.runtime.launch(
+            ptx_binary,
+            function_name,
+            grid_dim,
+            block_dim,
+            shared_mem_bytes,
+            params,
+        ).map_err(|e| anyhow!("Erro ao lançar kernel: {}", e))?;
         let elapsed = start.elapsed().as_micros() as u64;
+
+        let gpu = GpuIdentity::from_system().unwrap_or_default();
+
+        if let Some(hash) = kernel_hash {
+            let job_id_str = job_id.unwrap_or("unknown");
+            let node_id = &gpu.node_id;
+            self.correlator.record(&hash, job_id_str, node_id, 0.0, elapsed);
+            self.comparator.record_execution(&hash, op, dtype, shape, 0);
+
+            if let Some(prev_hash) = self.comparator.get_previous_execution(op, dtype, shape, &hash) {
+                if let Some((delta_kwh, delta_percent, delta_duration)) =
+                    self.comparator.compute_delta(&hash, &prev_hash)
+                {
+                    eprintln!(
+                        "[4D] Delta: {} kWh ({:.2}%), {} us",
+                        delta_kwh, delta_percent * 100.0, delta_duration
+                    );
+                }
+            }
+        }
+
         if let Some(sender) = &self.report_sender {
             if let Some(hash) = kernel_hash {
-                let gpu = GpuIdentity::from_system().unwrap_or_default();
                 let report = KernelExecutionReport {
                     kernel_hash: hash,
                     duration_micros: elapsed,
@@ -62,30 +99,31 @@ impl Executor {
                 let _ = sender.try_send(report);
             }
         }
+
         Ok(())
     }
 }
 
-// --------------------------------------------------------------------------
-// Função auxiliar que orquestra o lançamento a partir dos parâmetros FLIR
-// --------------------------------------------------------------------------
 pub fn execute_flir_kernel(
     ptx_bytes: &[u8],
     function_name: &str,
     flir_params: &Value,
     input_device_ptrs: &[*const c_void],
     output_device_ptrs: &[*const c_void],
-    shape: &[usize],                         // <-- shape completo
+    shape: &[usize],
     kernel_hash: Option<String>,
     sender: Option<mpsc::Sender<KernelExecutionReport>>,
+    correlator: Arc<Correlator>,
+    comparator: Arc<TemporalComparator>,
+    op: &str,
+    dtype: &str,
+    job_id: Option<&str>,
 ) -> Result<()> {
     let dims = shape.len();
     let tile_x = flir_params["tile_x"].as_i64().unwrap_or(128) as u32;
     let tile_y = flir_params["tile_y"].as_i64().unwrap_or(1) as u32;
     let shared_mem_bytes = flir_params["shared_mem_bytes"].as_u64().unwrap_or(0) as u32;
 
-    // Calcula grid e block de acordo com a dimensionalidade
-    // Para 3D: grid e block são 2D (Z é loop no kernel)
     let (grid, block) = match dims {
         1 => {
             let n = shape[0] as u32;
@@ -105,7 +143,6 @@ pub fn execute_flir_kernel(
         3 => {
             let n_x = shape[0] as u32;
             let n_y = shape[1] as u32;
-            // Z não é usado no grid/block (é loop)
             let block_x = tile_x.min(1024);
             let block_y = tile_y.min(1024);
             let grid_x = (n_x + block_x - 1) / block_x;
@@ -115,10 +152,6 @@ pub fn execute_flir_kernel(
         _ => return Err(anyhow!("Dimensão {} não suportada", dims)),
     };
 
-    // Monta a lista de parâmetros do kernel:
-    // 1D: [x, y, Nx]
-    // 2D: [x, y, Nx, Ny]
-    // 3D: [x, y, Nx, Ny, Nz]
     let mut params: Vec<*const c_void> = Vec::new();
     if input_device_ptrs.is_empty() || output_device_ptrs.is_empty() {
         return Err(anyhow!("Ponteiros de entrada/saída não fornecidos"));
@@ -139,7 +172,7 @@ pub fn execute_flir_kernel(
         params.push(&nz as *const i32 as *const c_void);
     }
 
-    let executor = Executor::new(sender)?;
+    let executor = Executor::new(sender, correlator, comparator)?;
     executor.launch_kernel(
         ptx_bytes,
         function_name,
@@ -148,5 +181,9 @@ pub fn execute_flir_kernel(
         shared_mem_bytes,
         &params,
         kernel_hash,
+        op,
+        dtype,
+        shape,
+        job_id,
     )
 }
