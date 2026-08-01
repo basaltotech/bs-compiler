@@ -1,15 +1,10 @@
-// crates/basalto-core/src/ir/stencil_3d.rs
-//! Implementação do stencil 3D com tiling X-Y e loop em Z.
-//! Estratégia: tiles em X e Y (com halo), eixo Z percorrido em loop.
-//! Para dz != 0, os dados são lidos da memória global (não cabem na tile 2D).
-
 use super::common;
 use super::StencilGenerator;
 use inkwell::{
     AddressSpace, IntPredicate,
     context::Context,
     module::Module,
-    values::{FloatValue, IntValue, PointerValue},
+    values::FloatValue,
 };
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -30,12 +25,12 @@ impl StencilGenerator for Stencil3D {
         let coeffs: Vec<f64> = params["coeffs"].as_array()
             .unwrap_or(&vec![serde_json::Value::from(1.0)])
             .iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
+        let tile_x = params["tile_x"].as_i64().unwrap_or(64);
+        let tile_y = params["tile_y"].as_i64().unwrap_or(64);
+        let stride_x = params["stride_x"].as_i64().unwrap_or(1);
+        let stride_y = params["stride_y"].as_i64().unwrap_or(1);
+        let stride_z = params["stride_z"].as_i64().unwrap_or(1);
 
-        // tile_x e tile_y (apenas X e Y são tiled; Z é loop)
-        let tile_x = params["tile_x"].as_i64().unwrap_or(64) as i64;
-        let tile_y = params["tile_y"].as_i64().unwrap_or(64) as i64;
-
-        // Tipos
         let f64 = ctx.f64_type();
         let f32 = ctx.f32_type();
         let float = if dtype == "f32" { f32 } else { f64 };
@@ -43,85 +38,36 @@ impl StencilGenerator for Stencil3D {
         let i64 = ctx.i64_type();
         let void = ctx.void_type();
 
-        // Assinatura: kernel(float* x, float* y, int Nx, int Ny, int Nz)
         let generic_ptr = float.ptr_type(AddressSpace(0));
-        let fn_type = void.fn_type(
-            &[
-                generic_ptr.into(),
-                generic_ptr.into(),
-                i32.into(),
-                i32.into(),
-                i32.into(),
-            ],
-            false,
-        );
+        let fn_type = void.fn_type(&[generic_ptr.into(), generic_ptr.into(), i32.into(), i32.into(), i32.into(), i32.into(), i32.into(), i32.into()], false);
         let kernel = module.add_function("basalto_kernel_3d", fn_type, None);
         let x_ptr = kernel.get_param(0).unwrap().into_pointer_value();
         let y_ptr = kernel.get_param(1).unwrap().into_pointer_value();
         let nx_param = kernel.get_param(2).unwrap().into_int_value();
         let ny_param = kernel.get_param(3).unwrap().into_int_value();
         let nz_param = kernel.get_param(4).unwrap().into_int_value();
+        let stride_x_param = kernel.get_param(5).unwrap().into_int_value();
+        let stride_y_param = kernel.get_param(6).unwrap().into_int_value();
+        let stride_z_param = kernel.get_param(7).unwrap().into_int_value();
 
         let entry = ctx.append_basic_block(kernel, "entry");
         let builder = ctx.create_builder();
         builder.position_at_end(entry);
 
-        // Cast para global
-        let x_global = builder.build_address_space_cast(
-            x_ptr,
-            float.ptr_type(AddressSpace(1)),
-            "x_global",
-        );
-        let y_global = builder.build_address_space_cast(
-            y_ptr,
-            float.ptr_type(AddressSpace(1)),
-            "y_global",
-        );
+        let x_global = builder.build_address_space_cast(x_ptr, float.ptr_type(AddressSpace(1)), "x_global");
+        let y_global = builder.build_address_space_cast(y_ptr, float.ptr_type(AddressSpace(1)), "y_global");
 
-        // Memória compartilhada para a tile 2D (X-Y) + halo
         let shared = common::declare_shared_memory(module, float, dtype);
         let (tid_x, bid_x, bdim_x, tid_y, bid_y, bdim_y, barrier) =
             common::declare_nvptx_intrinsics(module, i32, void);
 
-        // Ler registros X e Y (Z não tem thread/block)
-        let tidx = builder
-            .build_call(tid_x, &[], "tidx")
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        let tidy = builder
-            .build_call(tid_y, &[], "tidy")
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        let bidx = builder
-            .build_call(bid_x, &[], "bidx")
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        let bidy = builder
-            .build_call(bid_y, &[], "bidy")
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        let bdimx = builder
-            .build_call(bdim_x, &[], "bdimx")
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        let bdimy = builder
-            .build_call(bdim_y, &[], "bdimy")
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
+        let tidx = builder.build_call(tid_x, &[], "tidx").try_as_basic_value().left().unwrap().into_int_value();
+        let tidy = builder.build_call(tid_y, &[], "tidy").try_as_basic_value().left().unwrap().into_int_value();
+        let bidx = builder.build_call(bid_x, &[], "bidx").try_as_basic_value().left().unwrap().into_int_value();
+        let bidy = builder.build_call(bid_y, &[], "bidy").try_as_basic_value().left().unwrap().into_int_value();
+        let bdimx = builder.build_call(bdim_x, &[], "bdimx").try_as_basic_value().left().unwrap().into_int_value();
+        let bdimy = builder.build_call(bdim_y, &[], "bdimy").try_as_basic_value().left().unwrap().into_int_value();
 
-        // Converter para i64
         let tidx64 = builder.build_int_cast(tidx, i64, "tidx64");
         let tidy64 = builder.build_int_cast(tidy, i64, "tidy64");
         let bidx64 = builder.build_int_cast(bidx, i64, "bidx64");
@@ -131,16 +77,17 @@ impl StencilGenerator for Stencil3D {
         let nx64 = builder.build_int_cast(nx_param, i64, "nx64");
         let ny64 = builder.build_int_cast(ny_param, i64, "ny64");
         let nz64 = builder.build_int_cast(nz_param, i64, "nz64");
+        let stride_x64 = builder.build_int_cast(stride_x_param, i64, "stride_x64");
+        let stride_y64 = builder.build_int_cast(stride_y_param, i64, "stride_y64");
+        let stride_z64 = builder.build_int_cast(stride_z_param, i64, "stride_z64");
 
         let const_i64 = |v: i64| i64.const_int(v as u64, false);
 
-        // Índices globais X e Y
         let tile_start_x = builder.build_int_mul(bidx64, bdimx64, "tile_start_x");
         let tile_start_y = builder.build_int_mul(bidy64, bdimy64, "tile_start_y");
         let global_x = builder.build_int_add(tile_start_x, tidx64, "global_x");
         let global_y = builder.build_int_add(tile_start_y, tidy64, "global_y");
 
-        // Bounds check X e Y (se estourar, sai)
         let cond_out_x = builder.build_int_compare(IntPredicate::UGE, global_x, nx64, "cond_out_x");
         let cond_out_y = builder.build_int_compare(IntPredicate::UGE, global_y, ny64, "cond_out_y");
         let cond_out = builder.build_or(cond_out_x, cond_out_y, "cond_out");
@@ -152,29 +99,32 @@ impl StencilGenerator for Stencil3D {
         let zero = float.const_float(0.0);
         let one_i64 = const_i64(1);
 
-        // Função auxiliar para ler da global com bounds check 3D
         let safe_load_global_3d = |z: IntValue, y: IntValue, x: IntValue| -> FloatValue {
-            // Índice linear: (z * Ny + y) * Nx + x
-            let zy = builder.build_int_mul(z, ny64, "zy");
-            let zy_y = builder.build_int_add(zy, y, "zy_y");
-            let idx = builder.build_int_mul(zy_y, nx64, "idx_linear");
-            let idx_final = builder.build_int_add(idx, x, "idx_final");
+            let z_stride = builder.build_int_mul(z, stride_z64, "z_stride");
+            let y_stride = builder.build_int_mul(y, stride_y64, "y_stride");
+            let x_stride = builder.build_int_mul(x, stride_x64, "x_stride");
+            let idx = builder.build_int_add(builder.build_int_add(z_stride, y_stride, "zy_stride"), x_stride, "linear_idx");
             common::safe_load_global(
                 &builder,
                 x_global,
-                idx_final,
-                builder.build_int_mul(builder.build_int_mul(nx64, ny64, "nxy"), nz64, "total"),
+                idx,
+                builder.build_int_mul(
+                    builder.build_int_mul(
+                        builder.build_int_mul(nx64, stride_x64, "sx"),
+                        ny64,
+                        "sxy"
+                    ),
+                    nz64,
+                    "total"
+                ),
                 zero,
                 const_i64,
             )
         };
 
-        // Tamanho da tile em X e Y (incluindo halo)
         let shared_width = builder.build_int_add(bdimx64, const_i64(2 * radius), "shared_width");
         let shared_height = builder.build_int_add(bdimy64, const_i64(2 * radius), "shared_height");
-        let total_shared_elems = builder.build_int_mul(shared_width, shared_height, "total_shared_elems");
 
-        // Loop principal em Z
         let z_zero = const_i64(0);
         let z_cond = builder.build_int_compare(IntPredicate::SLT, z_zero, nz64, "z_cond");
         let z_loop_block = ctx.append_basic_block(kernel, "z_loop");
@@ -183,29 +133,22 @@ impl StencilGenerator for Stencil3D {
         builder.build_conditional_branch(z_cond, z_loop_block, z_end_block);
         builder.position_at_end(z_loop_block);
 
-        // PHI para o contador Z
         let z_phi = builder.build_phi(i64, "z_phi");
         z_phi.add_incoming(&[(&z_zero, body_block)]);
 
         let z_current = z_phi.as_basic_value().into_int_value();
 
-        // ================================================================
-        // 1. CARREGAR A FATIA X-Y PARA O Z ATUAL (com halo em X e Y)
-        // ================================================================
-        // Cada thread carrega o centro: x[z][global_y][global_x]
         let center_val = safe_load_global_3d(z_current, global_y, global_x);
         let center_idx_x = builder.build_int_add(tidx64, const_i64(radius), "center_x");
         let center_idx_y = builder.build_int_add(tidy64, const_i64(radius), "center_y");
         let center_flat = builder.build_int_add(
             builder.build_int_mul(center_idx_y, shared_width, "center_row_shift"),
             center_idx_x,
-            "center_flat",
+            "center_flat"
         );
-        let center_store =
-            unsafe { builder.build_gep(shared, &[const_i64(0), center_flat], "center_store") };
+        let center_store = unsafe { builder.build_gep(shared, &[const_i64(0), center_flat], "center_store") };
         builder.build_store(center_store, center_val);
 
-        // Halo esquerdo (X): tid_x == 0
         let left_cond = builder.build_int_compare(IntPredicate::EQ, tidx64, const_i64(0), "left_cond");
         let left_block = ctx.append_basic_block(kernel, "left_halo");
         let after_left = ctx.append_basic_block(kernel, "after_left");
@@ -215,22 +158,16 @@ impl StencilGenerator for Stencil3D {
             let x_left = builder.build_int_sub(global_x, one_i64, "x_left");
             let val_left = safe_load_global_3d(z_current, global_y, x_left);
             let left_store_idx = builder.build_int_add(
-                builder.build_int_mul(
-                    builder.build_int_add(tidy64, const_i64(radius), "left_row"),
-                    shared_width,
-                    "left_row_shift",
-                ),
+                builder.build_int_mul(builder.build_int_add(tidy64, const_i64(radius), "left_row"), shared_width, "left_row_shift"),
                 const_i64(0),
-                "left_flat",
+                "left_flat"
             );
-            let left_store =
-                unsafe { builder.build_gep(shared, &[const_i64(0), left_store_idx], "left_store") };
+            let left_store = unsafe { builder.build_gep(shared, &[const_i64(0), left_store_idx], "left_store") };
             builder.build_store(left_store, val_left);
         }
         builder.build_unconditional_branch(after_left);
         builder.position_at_end(after_left);
 
-        // Halo direito (X): tid_x == bdimx64 - 1
         let right_threshold_x = builder.build_int_sub(bdimx64, one_i64, "right_threshold_x");
         let right_cond = builder.build_int_compare(IntPredicate::EQ, tidx64, right_threshold_x, "right_cond");
         let right_block = ctx.append_basic_block(kernel, "right_halo");
@@ -241,22 +178,16 @@ impl StencilGenerator for Stencil3D {
             let x_right = builder.build_int_add(global_x, one_i64, "x_right");
             let val_right = safe_load_global_3d(z_current, global_y, x_right);
             let right_store_idx = builder.build_int_add(
-                builder.build_int_mul(
-                    builder.build_int_add(tidy64, const_i64(radius), "right_row"),
-                    shared_width,
-                    "right_row_shift",
-                ),
+                builder.build_int_mul(builder.build_int_add(tidy64, const_i64(radius), "right_row"), shared_width, "right_row_shift"),
                 builder.build_int_add(bdimx64, const_i64(radius), "right_col"),
-                "right_flat",
+                "right_flat"
             );
-            let right_store =
-                unsafe { builder.build_gep(shared, &[const_i64(0), right_store_idx], "right_store") };
+            let right_store = unsafe { builder.build_gep(shared, &[const_i64(0), right_store_idx], "right_store") };
             builder.build_store(right_store, val_right);
         }
         builder.build_unconditional_branch(after_right);
         builder.position_at_end(after_right);
 
-        // Halo inferior (Y): tid_y == 0
         let bottom_cond = builder.build_int_compare(IntPredicate::EQ, tidy64, const_i64(0), "bottom_cond");
         let bottom_block = ctx.append_basic_block(kernel, "bottom_halo");
         let after_bottom = ctx.append_basic_block(kernel, "after_bottom");
@@ -268,16 +199,14 @@ impl StencilGenerator for Stencil3D {
             let bottom_store_idx = builder.build_int_add(
                 builder.build_int_mul(const_i64(0), shared_width, "bottom_row_shift"),
                 builder.build_int_add(tidx64, const_i64(radius), "bottom_col"),
-                "bottom_flat",
+                "bottom_flat"
             );
-            let bottom_store =
-                unsafe { builder.build_gep(shared, &[const_i64(0), bottom_store_idx], "bottom_store") };
+            let bottom_store = unsafe { builder.build_gep(shared, &[const_i64(0), bottom_store_idx], "bottom_store") };
             builder.build_store(bottom_store, val_bottom);
         }
         builder.build_unconditional_branch(after_bottom);
         builder.position_at_end(after_bottom);
 
-        // Halo superior (Y): tid_y == bdimy64 - 1
         let top_threshold_y = builder.build_int_sub(bdimy64, one_i64, "top_threshold_y");
         let top_cond = builder.build_int_compare(IntPredicate::EQ, tidy64, top_threshold_y, "top_cond");
         let top_block = ctx.append_basic_block(kernel, "top_halo");
@@ -288,27 +217,18 @@ impl StencilGenerator for Stencil3D {
             let y_top = builder.build_int_add(global_y, one_i64, "y_top");
             let val_top = safe_load_global_3d(z_current, y_top, global_x);
             let top_store_idx = builder.build_int_add(
-                builder.build_int_mul(
-                    builder.build_int_add(bdimy64, const_i64(radius), "top_row"),
-                    shared_width,
-                    "top_row_shift",
-                ),
+                builder.build_int_mul(builder.build_int_add(bdimy64, const_i64(radius), "top_row"), shared_width, "top_row_shift"),
                 builder.build_int_add(tidx64, const_i64(radius), "top_col"),
-                "top_flat",
+                "top_flat"
             );
-            let top_store =
-                unsafe { builder.build_gep(shared, &[const_i64(0), top_store_idx], "top_store") };
+            let top_store = unsafe { builder.build_gep(shared, &[const_i64(0), top_store_idx], "top_store") };
             builder.build_store(top_store, val_top);
         }
         builder.build_unconditional_branch(after_top);
         builder.position_at_end(after_top);
 
-        // Sincronizar após carregar a tile
         builder.build_call(barrier, &[], "sync_after_load");
 
-        // ================================================================
-        // 2. CALCULAR O STENCIL 3D (dz usa global, dx/dy usam shared)
-        // ================================================================
         let mut result = float.const_float(0.0);
         let coeff_count = (2 * radius + 1) as usize;
         let coeff_count_sq = coeff_count * coeff_count;
@@ -319,167 +239,86 @@ impl StencilGenerator for Stencil3D {
             let dx_idx = (idx % coeff_count) as i64 - radius;
 
             let coeff_val = float.const_float(*coeff);
-
-            // Índice do vizinho em Z
             let z_neighbor = builder.build_int_add(z_current, const_i64(dz_idx), "z_neighbor");
-            // Verifica se z_neighbor está dentro dos limites
-            let z_valid_low = builder.build_int_compare(
-                IntPredicate::SGE,
-                z_neighbor,
-                const_i64(0),
-                "z_valid_low",
-            );
-            let z_valid_high = builder.build_int_compare(
-                IntPredicate::SLT,
-                z_neighbor,
-                nz64,
-                "z_valid_high",
-            );
+            let z_valid_low = builder.build_int_compare(IntPredicate::SGE, z_neighbor, const_i64(0), "z_valid_low");
+            let z_valid_high = builder.build_int_compare(IntPredicate::SLT, z_neighbor, nz64, "z_valid_high");
             let z_valid = builder.build_and(z_valid_low, z_valid_high, "z_valid");
 
-            // Se dz != 0, busca na global; se dz == 0, busca na shared (em X/Y)
-            let is_dz_zero = builder.build_int_compare(
-                IntPredicate::EQ,
-                const_i64(dz_idx),
-                const_i64(0),
-                "is_dz_zero",
-            );
+            let is_dz_zero = builder.build_int_compare(IntPredicate::EQ, const_i64(dz_idx), const_i64(0), "is_dz_zero");
 
-            // Valor do vizinho
             let neighbor_val = builder.build_select(
                 is_dz_zero,
                 {
-                    // Ler da shared (X e Y dentro da tile)
                     let neighbor_y = builder.build_int_add(center_idx_y, const_i64(dy_idx), "neighbor_y");
                     let neighbor_x = builder.build_int_add(center_idx_x, const_i64(dx_idx), "neighbor_x");
-                    let valid_y = builder.build_int_compare(
-                        IntPredicate::SGE,
-                        neighbor_y,
-                        const_i64(0),
-                        "ny_low",
-                    );
-                    let valid_y_h = builder.build_int_compare(
-                        IntPredicate::SLT,
-                        neighbor_y,
-                        shared_height,
-                        "ny_high",
-                    );
+                    let valid_y = builder.build_int_compare(IntPredicate::SGE, neighbor_y, const_i64(0), "ny_low");
+                    let valid_y_h = builder.build_int_compare(IntPredicate::SLT, neighbor_y, shared_height, "ny_high");
                     let valid_y_all = builder.build_and(valid_y, valid_y_h, "ny_valid");
-                    let valid_x = builder.build_int_compare(
-                        IntPredicate::SGE,
-                        neighbor_x,
-                        const_i64(0),
-                        "nx_low",
-                    );
-                    let valid_x_h = builder.build_int_compare(
-                        IntPredicate::SLT,
-                        neighbor_x,
-                        shared_width,
-                        "nx_high",
-                    );
+                    let valid_x = builder.build_int_compare(IntPredicate::SGE, neighbor_x, const_i64(0), "nx_low");
+                    let valid_x_h = builder.build_int_compare(IntPredicate::SLT, neighbor_x, shared_width, "nx_high");
                     let valid_x_all = builder.build_and(valid_x, valid_x_h, "nx_valid");
                     let valid_all = builder.build_and(valid_y_all, valid_x_all, "n_valid");
-                    let safe_y = builder.build_select(valid_y_all, neighbor_y, const_i64(0), "safe_y")
-                        .into_int_value();
-                    let safe_x = builder.build_select(valid_x_all, neighbor_x, const_i64(0), "safe_x")
-                        .into_int_value();
+                    let safe_y = builder.build_select(valid_y_all, neighbor_y, const_i64(0), "safe_y").into_int_value();
+                    let safe_x = builder.build_select(valid_x_all, neighbor_x, const_i64(0), "safe_x").into_int_value();
                     let flat_idx = builder.build_int_add(
                         builder.build_int_mul(safe_y, shared_width, "row_shift"),
                         safe_x,
-                        "flat_idx",
+                        "flat_idx"
                     );
-                    let ptr = unsafe {
-                        builder.build_gep(shared, &[const_i64(0), flat_idx], "shared_ptr")
-                    };
+                    let ptr = unsafe { builder.build_gep(shared, &[const_i64(0), flat_idx], "shared_ptr") };
                     builder.build_load(ptr, "shared_val").into_float_value()
                 },
                 {
-                    // Ler da global (dz != 0)
                     let y_global_neighbor = builder.build_int_add(global_y, const_i64(dy_idx), "gy");
                     let x_global_neighbor = builder.build_int_add(global_x, const_i64(dx_idx), "gx");
-                    let y_valid_global = builder.build_int_compare(
-                        IntPredicate::SGE,
-                        y_global_neighbor,
-                        const_i64(0),
-                        "y_gl",
-                    );
-                    let y_valid_global_h = builder.build_int_compare(
-                        IntPredicate::SLT,
-                        y_global_neighbor,
-                        ny64,
-                        "y_gh",
-                    );
+                    let y_valid_global = builder.build_int_compare(IntPredicate::SGE, y_global_neighbor, const_i64(0), "y_gl");
+                    let y_valid_global_h = builder.build_int_compare(IntPredicate::SLT, y_global_neighbor, ny64, "y_gh");
                     let y_valid_global_all = builder.build_and(y_valid_global, y_valid_global_h, "y_gv");
-                    let x_valid_global = builder.build_int_compare(
-                        IntPredicate::SGE,
-                        x_global_neighbor,
-                        const_i64(0),
-                        "x_gl",
-                    );
-                    let x_valid_global_h = builder.build_int_compare(
-                        IntPredicate::SLT,
-                        x_global_neighbor,
-                        nx64,
-                        "x_gh",
-                    );
+                    let x_valid_global = builder.build_int_compare(IntPredicate::SGE, x_global_neighbor, const_i64(0), "x_gl");
+                    let x_valid_global_h = builder.build_int_compare(IntPredicate::SLT, x_global_neighbor, nx64, "x_gh");
                     let x_valid_global_all = builder.build_and(x_valid_global, x_valid_global_h, "x_gv");
                     let valid_global_xy = builder.build_and(y_valid_global_all, x_valid_global_all, "xy_gv");
-                    // Se z válido e xy válido, carrega; senão zero
                     let z_and_xy = builder.build_and(z_valid, valid_global_xy, "z_and_xy");
                     let val_from_global = safe_load_global_3d(
                         z_neighbor,
-                        builder.build_select(y_valid_global_all, y_global_neighbor, const_i64(0))
-                            .into_int_value(),
-                        builder.build_select(x_valid_global_all, x_global_neighbor, const_i64(0))
-                            .into_int_value(),
+                        builder.build_select(y_valid_global_all, y_global_neighbor, const_i64(0)).into_int_value(),
+                        builder.build_select(x_valid_global_all, x_global_neighbor, const_i64(0)).into_int_value(),
                     );
-                    builder.build_select(z_and_xy, val_from_global, zero, "global_val")
-                        .into_float_value()
+                    builder.build_select(z_and_xy, val_from_global, zero, "global_val").into_float_value()
                 },
                 "neighbor_val",
-            )
-            .into_float_value();
+            ).into_float_value();
 
-            // Acumular
             let weighted = builder.build_float_mul(neighbor_val, coeff_val, "weighted");
             result = builder.build_float_add(result, weighted, "accum");
         }
 
-        // ================================================================
-        // 3. ARMAZENAR RESULTADO: y[z][global_y][global_x] = result
-        // ================================================================
+        builder.build_call(barrier, &[], "sync_after_compute");
+
         let idx_out = builder.build_int_add(
-            builder.build_int_mul(
-                builder.build_int_add(
-                    builder.build_int_mul(z_current, ny64, "zy_out"),
-                    global_y,
-                    "zy_y_out",
-                ),
-                nx64,
-                "base_out",
+            builder.build_int_mul(z_current, stride_z64, "z_out"),
+            builder.build_int_add(
+                builder.build_int_mul(global_y, stride_y64, "y_out"),
+                builder.build_int_mul(global_x, stride_x64, "x_out"),
+                "xy_out"
             ),
-            global_x,
-            "idx_out",
+            "idx_out"
         );
         let out_ptr = unsafe { builder.build_gep(y_global, &[idx_out], "out_ptr") };
         builder.build_store(out_ptr, result);
 
-        // Sincronizar antes de reusar a shared (opcional)
         builder.build_call(barrier, &[], "sync_after_compute");
 
-        // Incrementar Z e loop
         let z_next = builder.build_int_add(z_current, one_i64, "z_next");
         z_phi.add_incoming(&[(&z_next, body_block)]);
         let z_cond_next = builder.build_int_compare(IntPredicate::SLT, z_next, nz64, "z_cond_next");
         builder.build_conditional_branch(z_cond_next, z_loop_block, z_end_block);
 
-        // Bloco de saída
         builder.position_at_end(z_end_block);
         builder.build_unconditional_branch(exit_block);
         builder.position_at_end(exit_block);
         builder.build_return(None);
 
-        // Metadado NVPTX
         let func_meta = kernel.as_metadata_value();
         let kernel_str = ctx.metadata_string("kernel");
         let one_i32 = ctx.i32_type().const_int(1, false).as_metadata_value();

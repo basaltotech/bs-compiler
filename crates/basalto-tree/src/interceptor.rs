@@ -57,12 +57,16 @@ impl BasaltoInterceptor {
         op: String,
         dtype: String,
         shape: Vec<usize>,
+        strides: Vec<usize>,
         job_id: Option<String>,
         device_ptr_x: *mut c_void,
         device_ptr_y: *mut c_void,
     ) -> Result<()> {
         if shape.is_empty() || shape.len() > 3 {
             return Err(anyhow!("Apenas 1D, 2D e 3D são suportados (shape = {:?})", shape));
+        }
+        if shape.len() != strides.len() {
+            return Err(anyhow!("Shape e strides devem ter o mesmo comprimento"));
         }
         if device_ptr_x.is_null() || device_ptr_y.is_null() {
             return Err(anyhow!("Ponteiros de dispositivo nulos"));
@@ -105,6 +109,7 @@ impl BasaltoInterceptor {
                 &[device_ptr_x as *const c_void],
                 &[device_ptr_y as *const c_void],
                 &shape,
+                &strides,
                 Some(cache_key),
                 self.jit_sender.clone(),
                 self.correlator.clone(),
@@ -138,6 +143,7 @@ impl BasaltoInterceptor {
                 &[device_ptr_x as *const c_void],
                 &[device_ptr_y as *const c_void],
                 &shape,
+                &strides,
                 Some(cache_key),
                 self.jit_sender.clone(),
                 self.correlator.clone(),
@@ -150,7 +156,7 @@ impl BasaltoInterceptor {
 
         eprintln!("[Interceptor] Compilando do zero...");
 
-        let flir_module = build_flir("", &gpu.capabilities, &dtype, &shape)
+        let flir_module = build_flir("", &gpu.capabilities, &dtype, &shape, &strides)
             .map_err(|e| anyhow!("Falha ao construir FLIR: {}", e))?;
 
         let flir_op = flir_module.ops.first()
@@ -190,6 +196,7 @@ impl BasaltoInterceptor {
             &[device_ptr_x as *const c_void],
             &[device_ptr_y as *const c_void],
             &shape,
+            &strides,
             Some(cache_key),
             self.jit_sender.clone(),
             self.correlator.clone(),
@@ -250,6 +257,7 @@ impl PyBasaltoInterceptor {
         op: String,
         dtype: String,
         shape: Vec<usize>,
+        strides: Vec<usize>,
         job_id: Option<String>,
         device_ptr_x: usize,
         device_ptr_y: usize,
@@ -262,6 +270,7 @@ impl PyBasaltoInterceptor {
                 op,
                 dtype,
                 shape,
+                strides,
                 job_id,
                 ptr_x,
                 ptr_y,

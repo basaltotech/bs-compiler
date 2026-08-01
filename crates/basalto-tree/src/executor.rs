@@ -53,6 +53,7 @@ impl Executor {
         op: &str,
         dtype: &str,
         shape: &[usize],
+        strides: &[usize],
         job_id: Option<&str>,
     ) -> Result<()> {
         let start = std::time::Instant::now();
@@ -111,6 +112,7 @@ pub fn execute_flir_kernel(
     input_device_ptrs: &[*const c_void],
     output_device_ptrs: &[*const c_void],
     shape: &[usize],
+    strides: &[usize],
     kernel_hash: Option<String>,
     sender: Option<mpsc::Sender<KernelExecutionReport>>,
     correlator: Arc<Correlator>,
@@ -172,6 +174,28 @@ pub fn execute_flir_kernel(
         params.push(&nz as *const i32 as *const c_void);
     }
 
+    if dims >= 1 {
+        let sx = strides[0] as i32;
+        params.push(&sx as *const i32 as *const c_void);
+    } else {
+        let sx = 1;
+        params.push(&sx as *const i32 as *const c_void);
+    }
+    if dims >= 2 {
+        let sy = strides[1] as i32;
+        params.push(&sy as *const i32 as *const c_void);
+    } else {
+        let sy = 1;
+        params.push(&sy as *const i32 as *const c_void);
+    }
+    if dims >= 3 {
+        let sz = strides[2] as i32;
+        params.push(&sz as *const i32 as *const c_void);
+    } else {
+        let sz = 1;
+        params.push(&sz as *const i32 as *const c_void);
+    }
+
     let executor = Executor::new(sender, correlator, comparator)?;
     executor.launch_kernel(
         ptx_bytes,
@@ -184,6 +208,7 @@ pub fn execute_flir_kernel(
         op,
         dtype,
         shape,
+        strides,
         job_id,
     )
 }
