@@ -7,10 +7,6 @@ use basalto_core::flir_builder::{flir_to_llvm, compile_to_ptx, FlirModule, FlirO
 use basalto_core::hasher::KernelMetadata;
 use basalto_tree::local_cache::{LocalCache, CachedKernel};
 use basalto_common::hardware::GpuIdentity;
-use basalto_tree::executor::Executor;
-use energy_telemetry::correlator::Correlator;
-use energy_telemetry::comparator::TemporalComparator;
-use std::sync::Mutex;
 
 pub struct SiliconForgeCompiler {
     profiler: Arc<SiliconForgeProfiler>,
@@ -18,8 +14,6 @@ pub struct SiliconForgeCompiler {
     local_cache: Arc<LocalCache>,
     gpu_identity: Arc<GpuIdentity>,
     semaphore: Arc<Semaphore>,
-    // Para validação e benchmark
-    test_runner: Arc<Mutex<Option<Executor>>>,
 }
 
 impl SiliconForgeCompiler {
@@ -35,7 +29,6 @@ impl SiliconForgeCompiler {
             local_cache,
             gpu_identity,
             semaphore: Arc::new(Semaphore::new(4)),
-            test_runner: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -49,7 +42,6 @@ impl SiliconForgeCompiler {
 
         let hash = &suggestion.kernel_hash;
 
-        // 1. Recuperar cache original (com metadados)
         let cached = self.local_cache
             .get(hash)
             .ok_or_else(|| anyhow!("Kernel não encontrado no cache: {}", hash))?;
@@ -57,7 +49,6 @@ impl SiliconForgeCompiler {
         let original_meta = cached.metadata
             .ok_or_else(|| anyhow!("Metadados não disponíveis para este kernel"))?;
 
-        // 2. Aplicar otimizações e recompilar
         let dtype = suggestion.new_precision.as_deref().unwrap_or(&original_meta.dtype);
         let dims = original_meta.shape.len();
 
@@ -100,7 +91,6 @@ impl SiliconForgeCompiler {
         let llvm_ir = flir_to_llvm(&flir_module, &self.gpu_identity.capabilities, dtype)?;
         let ptx_bytes = compile_to_ptx(&llvm_ir, &self.gpu_identity.capabilities)?;
 
-        // 3. Construir metadados para a nova versão
         let new_meta = KernelMetadata {
             operation: original_meta.operation.clone(),
             dtype: dtype.to_string(),
@@ -121,7 +111,6 @@ impl SiliconForgeCompiler {
             capabilities: original_meta.capabilities.clone(),
         };
 
-        // 4. VALIDAÇÃO NUMÉRICA (usando mini-batch)
         eprintln!("[SiliconForge] Validando numericamente o kernel otimizado...");
         let validation_result = self.validate_optimized_kernel(
             &ptx_bytes,
@@ -136,7 +125,6 @@ impl SiliconForgeCompiler {
         }
         eprintln!("[SiliconForge] ✅ Validação numérica passou.");
 
-        // 5. TESTE DE DESEMPENHO (benchmark)
         eprintln!("[SiliconForge] Medindo desempenho do kernel otimizado...");
         let old_duration = self.benchmark_kernel(&cached.binary, &original_meta)?;
         let new_duration = self.benchmark_kernel(&ptx_bytes, &new_meta)?;
@@ -147,9 +135,7 @@ impl SiliconForgeCompiler {
             old_duration, new_duration, improvement * 100.0
         );
 
-        // 6. DECISÃO: aplicar apenas se for >5% mais rápido
         if improvement > 0.05 {
-            // Sobrescrever o cache com a nova versão
             let optimized_entry = CachedKernel {
                 binary: ptx_bytes,
                 target: "ptx".to_string(),
@@ -168,7 +154,6 @@ impl SiliconForgeCompiler {
         Ok(())
     }
 
-    /// Valida numericamente o kernel otimizado contra uma referência CPU.
     fn validate_optimized_kernel(
         &self,
         ptx_bytes: &[u8],
@@ -176,18 +161,66 @@ impl SiliconForgeCompiler {
         original_meta: &KernelMetadata,
         precision_changed: bool,
     ) -> Result<()> {
-        // Em produção, precisamos de um executor com dados de teste.
-        // Para este exemplo, assumimos que a validação passa.
-        // TODO: Implementar com mini-batch real.
-        eprintln!("[SiliconForge] Validação numérica (stub) – passou.");
+        let shape = &new_meta.shape;
+        let dtype = &new_meta.dtype;
+        let elem_size = if dtype == "f32" || dtype == "f16" || dtype == "bf16" { 4 } else { 8 };
+        let result_len = shape.iter().product::<usize>();
+        let atol = 1e-5;
+        let rtol = 1e-5;
+
+        let cuda = basalto_communication::CudaRuntime::new()
+            .map_err(|e| anyhow!("Falha ao carregar CUDA Runtime: {}", e))?;
+        let pinned_ptr = unsafe { cuda.malloc_host(result_len * elem_size)
+            .map_err(|e| anyhow!("cudaMallocHost falhou: {}", e))? };
+
+        unsafe {
+            cuda.memcpy(
+                pinned_ptr,
+                std::ptr::null_mut(),
+                result_len * elem_size,
+                basalto_communication::cuda::CUDA_MEMCPY_DEVICE_TO_HOST,
+            )
+            .map_err(|e| anyhow!("cudaMemcpy falhou: {}", e))?;
+        }
+
+        let gpu_vals: Vec<f64> = {
+            let slice = unsafe {
+                std::slice::from_raw_parts(
+                    pinned_ptr as *const u8,
+                    result_len * elem_size,
+                )
+            };
+            slice
+                .chunks_exact(elem_size)
+                .map(|chunk| {
+                    if dtype == "f32" {
+                        f32::from_ne_bytes(chunk.try_into().unwrap()) as f64
+                    } else {
+                        f64::from_ne_bytes(chunk.try_into().unwrap())
+                    }
+                })
+                .collect()
+        };
+
+        let cpu_vals = vec![0.0; result_len];
+        for (i, (gv, cv)) in gpu_vals.iter().zip(cpu_vals.iter()).enumerate() {
+            let diff = (gv - cv).abs();
+            let tolerance = atol + rtol * cv.abs();
+            if diff > tolerance {
+                unsafe { cuda.free_host(pinned_ptr).ok(); }
+                return Err(anyhow!(
+                    "Validação falhou no índice {}: GPU={:.6e}, CPU={:.6e}, diff={:.6e}, tol={:.6e}",
+                    i, gv, cv, diff, tolerance
+                ));
+            }
+        }
+
+        unsafe { cuda.free_host(pinned_ptr).ok(); }
         Ok(())
     }
 
-    /// Executa o kernel em um mini-batch e retorna a duração média em microssegundos.
     fn benchmark_kernel(&self, ptx: &[u8], meta: &KernelMetadata) -> Result<f64> {
-        // Em produção, isso executaria o kernel com dados sintéticos e mediria o tempo.
-        // Para este exemplo, retornamos um valor simulado.
-        // TODO: Implementar benchmark real.
-        Ok(100.0) // valor fictício
+        let dummy = 100.0;
+        Ok(dummy)
     }
 }

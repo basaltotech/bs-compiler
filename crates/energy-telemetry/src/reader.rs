@@ -159,14 +159,15 @@ impl AutoEnergyReader {
     }
 
     fn discover_bmc_ip() -> Option<String> {
-        let output = Command::new("dmidecode").args(["-t", "38"]).output().ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if line.contains("IPMI Address") || line.contains("Base Address") {
-                if let Some(ip) = line.split(':').nth(1) {
-                    let ip = ip.trim();
-                    if !ip.is_empty() && ip.chars().filter(|c| *c == '.').count() == 3 {
-                        return Some(ip.to_string());
+        if let Ok(output) = Command::new("dmidecode").args(["-t", "38"]).output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.contains("IPMI Address") || line.contains("Base Address") {
+                    if let Some(ip) = line.split(':').nth(1) {
+                        let ip = ip.trim();
+                        if !ip.is_empty() && ip.chars().filter(|c| *c == '.').count() == 3 {
+                            return Some(ip.to_string());
+                        }
                     }
                 }
             }
@@ -181,8 +182,28 @@ impl AutoEnergyReader {
         None
     }
 
+    fn read_ipmi_power() -> Result<f64> {
+        let out = Command::new("ipmitool").args(["dcmi", "power", "reading"]).output()?;
+        if !out.status.success() {
+            return Err(anyhow!("ipmitool dcmi power reading falhou"));
+        }
+        let s = String::from_utf8(out.stdout)?;
+        for line in s.lines() {
+            if line.contains("Instantaneous power") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(val) = parts.get(2) {
+                    return Ok(val.parse::<f64>()?);
+                }
+            }
+        }
+        Err(anyhow!("Potência IPMI não encontrada na saída"))
+    }
+
     fn read_ipmi_energy_joules() -> Result<f64> {
         let out = Command::new("ipmitool").args(["sdr", "list"]).output()?;
+        if !out.status.success() {
+            return Err(anyhow!("ipmitool sdr list falhou"));
+        }
         let s = String::from_utf8(out.stdout)?;
         for line in s.lines() {
             if line.contains("Energy") || line.contains("kWh") {
@@ -194,6 +215,46 @@ impl AutoEnergyReader {
             }
         }
         Err(anyhow!("Contador de energia IPMI não encontrado"))
+    }
+
+    fn read_redfish_power(bmc_ip: &str, user: Option<&str>, pass: Option<&str>) -> Result<f64> {
+        let url = format!("https://{}/redfish/v1/Chassis/1/Power", bmc_ip);
+        let client = reqwest::blocking::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(2))
+            .build()?;
+        let resp = client
+            .get(&url)
+            .basic_auth(user.unwrap_or("admin"), pass.map(|p| p.as_str()))
+            .send()?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("Redfish retornou status {}", resp.status()));
+        }
+        let json: Value = resp.json()?;
+        let watts = json["PowerControl"][0]["PowerConsumedWatts"]
+            .as_f64()
+            .ok_or_else(|| anyhow!("PowerConsumedWatts não encontrado"))?;
+        Ok(watts)
+    }
+
+    fn read_redfish_energy_joules(bmc_ip: &str, user: Option<&str>, pass: Option<&str>) -> Result<f64> {
+        let url = format!("https://{}/redfish/v1/Chassis/1/Power", bmc_ip);
+        let client = reqwest::blocking::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(2))
+            .build()?;
+        let resp = client
+            .get(&url)
+            .basic_auth(user.unwrap_or("admin"), pass.map(|p| p.as_str()))
+            .send()?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("Redfish retornou status {}", resp.status()));
+        }
+        let json: Value = resp.json()?;
+        let kwh = json["PowerControl"][0]["EnergyConsumedkWh"]
+            .as_f64()
+            .ok_or_else(|| anyhow!("EnergyConsumedkWh não encontrado"))?;
+        Ok(kwh * 3_600_000.0)
     }
 }
 
@@ -208,35 +269,10 @@ impl EnergyReader for AutoEnergyReader {
                 let nvml = self.nvml.as_ref().ok_or_else(|| anyhow!("NVML não disponível"))?;
                 unsafe { Ok(nvml.get_power_mw()? as f64 / 1000.0) }
             }
-            EnergySource::Ipmi => {
-                let out = Command::new("ipmitool").args(["dcmi", "power", "reading"]).output()?;
-                let s = String::from_utf8(out.stdout)?;
-                for line in s.lines() {
-                    if line.contains("Instantaneous power") {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if let Some(val) = parts.get(2) {
-                            return Ok(val.parse::<f64>()?);
-                        }
-                    }
-                }
-                Err(anyhow!("Potência IPMI não encontrada"))
-            }
+            EnergySource::Ipmi => Self::read_ipmi_power(),
             EnergySource::Redfish => {
                 let ip = self.bmc_ip.as_ref().ok_or_else(|| anyhow!("BMC IP não definido"))?;
-                let url = format!("https://{}/redfish/v1/Chassis/1/Power", ip);
-                let client = reqwest::blocking::Client::builder()
-                    .danger_accept_invalid_certs(true)
-                    .timeout(std::time::Duration::from_secs(2))
-                    .build()?;
-                let resp = client
-                    .get(&url)
-                    .basic_auth(self.redfish_user.as_deref().unwrap_or("admin"), self.redfish_pass.as_deref())
-                    .send()?;
-                let json: Value = resp.json()?;
-                let watts = json["PowerControl"][0]["PowerConsumedWatts"]
-                    .as_f64()
-                    .ok_or_else(|| anyhow!("PowerConsumedWatts não encontrado"))?;
-                Ok(watts)
+                Self::read_redfish_power(ip, self.redfish_user.as_deref(), self.redfish_pass.as_deref())
             }
             EnergySource::Unavailable => Err(anyhow!("Nenhuma fonte de telemetria disponível")),
         }
@@ -254,20 +290,7 @@ impl EnergyReader for AutoEnergyReader {
             EnergySource::Ipmi => Self::read_ipmi_energy_joules(),
             EnergySource::Redfish => {
                 let ip = self.bmc_ip.as_ref().ok_or_else(|| anyhow!("BMC IP não definido"))?;
-                let url = format!("https://{}/redfish/v1/Chassis/1/Power", ip);
-                let client = reqwest::blocking::Client::builder()
-                    .danger_accept_invalid_certs(true)
-                    .timeout(std::time::Duration::from_secs(2))
-                    .build()?;
-                let resp = client
-                    .get(&url)
-                    .basic_auth(self.redfish_user.as_deref().unwrap_or("admin"), self.redfish_pass.as_deref())
-                    .send()?;
-                let json: Value = resp.json()?;
-                let kwh = json["PowerControl"][0]["EnergyConsumedkWh"]
-                    .as_f64()
-                    .ok_or_else(|| anyhow!("EnergyConsumedkWh não encontrado"))?;
-                Ok(kwh * 3_600_000.0)
+                Self::read_redfish_energy_joules(ip, self.redfish_user.as_deref(), self.redfish_pass.as_deref())
             }
             EnergySource::Unavailable => Err(anyhow!("Nenhuma fonte de telemetria disponível")),
         }

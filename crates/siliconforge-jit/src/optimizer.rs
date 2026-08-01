@@ -156,11 +156,10 @@ impl SiliconForgeOptimizer {
     }
 
     fn suggest_tensor_core(&self, profile: &KernelProfile) -> Option<OptimizationSuggestion> {
-        // Só sugere Tensor Core se o kernel for 3D, demorado e tiver tile compatível com 16x16
         if profile.avg_duration_us > 3000.0
             && profile.avg_block.0 >= 16.0
             && profile.avg_block.1 >= 16.0
-            && profile.avg_grid.2 < 2.0 // Assume que grid.z == 1 (típico para loop Z)
+            && profile.avg_grid.2 < 2.0
         {
             return Some(OptimizationSuggestion {
                 kernel_hash: profile.kernel_hash.clone(),

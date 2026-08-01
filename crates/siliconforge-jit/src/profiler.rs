@@ -1,7 +1,5 @@
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,8 +69,8 @@ impl SiliconForgeProfiler {
         let count = records.len() as u64;
         let total_duration: u64 = records.iter().map(|r| r.duration_us).sum();
         let avg = total_duration as f64 / count as f64;
-        let min = records.iter().map(|r| r.duration_us).min().unwrap();
-        let max = records.iter().map(|r| r.duration_us).max().unwrap();
+        let min = records.iter().map(|r| r.duration_us).min().unwrap_or(0);
+        let max = records.iter().map(|r| r.duration_us).max().unwrap_or(0);
         let mut durations: Vec<u64> = records.iter().map(|r| r.duration_us).collect();
         durations.sort_unstable();
         let p50 = durations[(count as usize / 2).min(durations.len() - 1)];
