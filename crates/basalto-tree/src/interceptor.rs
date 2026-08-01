@@ -8,7 +8,7 @@ use basalto_common::hardware::{GpuIdentity, DeviceCapabilities};
 use basalto_core::hasher::KernelMetadata;
 use basalto_core::flir_builder::{build_flir, flir_to_llvm, compile_to_ptx};
 use basalto_tree::local_cache::{self, LocalCache};
-use basalto_tree::executor::{execute_flir_kernel, KernelExecutionReport};
+use basalto_tree::executor::{execute_flir_kernel, execute_cublas_kernel, KernelExecutionReport};
 use energy_telemetry::correlator::Correlator;
 use energy_telemetry::comparator::TemporalComparator;
 use siliconforge_jit::{SiliconForgeProfiler, SiliconForgeOptimizer, SiliconForgeCompiler};
@@ -49,14 +49,10 @@ impl BasaltoInterceptor {
         let comparator = Arc::new(TemporalComparator::new(correlator.clone()));
         let local_cache = Arc::new(LocalCache::new_with_capacity(10_000));
 
-        // ================================================================
-        // INICIALIZAÇÃO DO MPI / NCCL / CUDA PARA TROCA DE HALOS
-        // ================================================================
         let mpi = match MpiRuntime::new() {
             Ok(m) => Arc::new(m),
             Err(e) => {
                 eprintln!("[Interceptor] MPI não disponível: {}", e);
-                // Retorna um interceptor sem suporte a comunicação (modo single-node)
                 let (profiler_tx, _) = mpsc::channel(1);
                 let profiler = Arc::new(SiliconForgeProfiler::new());
                 let gpu = GpuIdentity::from_system().unwrap_or_default();
@@ -80,14 +76,17 @@ impl BasaltoInterceptor {
                 let handle = tokio::spawn(async move {
                     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
                     loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                        let profiles = profiler.get_all_profiles();
-                        for profile in &profiles {
-                            let suggestions = optimizer.analyze(profile);
-                            for suggestion in suggestions {
-                                if suggestion.confidence > 0.6 {
-                                    if let Err(e) = compiler.process_suggestion(suggestion).await {
-                                        eprintln!("[SiliconForge] Erro ao aplicar otimização: {}", e);
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let profiles = profiler.get_all_profiles();
+                                for profile in &profiles {
+                                    let suggestions = optimizer.analyze(profile);
+                                    for suggestion in suggestions {
+                                        if suggestion.confidence > 0.6 {
+                                            if let Err(e) = compiler.process_suggestion(suggestion).await {
+                                                eprintln!("[SiliconForge] Erro ao aplicar otimização: {}", e);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -131,9 +130,6 @@ impl BasaltoInterceptor {
             }
         };
 
-        // ================================================================
-        // INICIALIZAÇÃO DO SILICONFORGE JIT
-        // ================================================================
         let (profiler_tx, mut profiler_rx) = mpsc::channel::<KernelExecutionRecord>(10000);
         let profiler = Arc::new(SiliconForgeProfiler::new());
 
@@ -193,7 +189,6 @@ impl BasaltoInterceptor {
         }
     }
 
-    /// Extrai o `radius` da operação. Exemplo: "stencil_3d_r4" -> radius=4
     fn extract_radius(op: &str) -> usize {
         if let Some(r) = op.split("_r").nth(1) {
             if let Ok(radius) = r.parse::<usize>() {
@@ -214,7 +209,61 @@ impl BasaltoInterceptor {
         job_id: Option<String>,
         device_ptr_x: *mut c_void,
         device_ptr_y: *mut c_void,
+        device_ptr_z: *mut c_void,
     ) -> Result<()> {
+        if op == "matmul" {
+            if shape.len() != 4 {
+                return Err(anyhow!("MatMul espera shape [batch, m, k, n]"));
+            }
+            let batch = shape[0];
+            let m = shape[1];
+            let k = shape[2];
+            let n = shape[3];
+            let trans_a = false;
+            let trans_b = false;
+
+            let gpu = GpuIdentity::from_system()
+                .map_err(|e| anyhow!("Falha ao detectar GPU: {}", e))?;
+
+            let meta = KernelMetadata {
+                operation: op.clone(),
+                dtype: dtype.clone(),
+                shape: shape.clone(),
+                strides: strides.clone(),
+                radius: 0,
+                matmul_m: Some(m),
+                matmul_n: Some(n),
+                matmul_k: Some(k),
+                matmul_trans_a: Some(trans_a),
+                matmul_trans_b: Some(trans_b),
+                matmul_batch: Some(batch),
+                vendor: gpu.vendor.clone(),
+                arch: gpu.arch.clone(),
+                driver_version: gpu.driver_version.clone(),
+                job_id: None,
+                node_id: None,
+                capabilities: gpu.capabilities.clone(),
+            };
+            let cache_key = meta.cache_key();
+            eprintln!("[Interceptor] MatMul via cuBLAS (chave: {})", cache_key);
+
+            return execute_cublas_kernel(
+                device_ptr_x,
+                device_ptr_z,
+                device_ptr_y,
+                m, n, k,
+                trans_a, trans_b,
+                batch,
+                &dtype,
+                Some(cache_key),
+                self.jit_sender.clone(),
+                self.profiler_sender.clone(),
+                self.correlator.clone(),
+                self.comparator.clone(),
+                job_id.as_deref(),
+            );
+        }
+
         if shape.is_empty() || shape.len() > 3 {
             return Err(anyhow!("Apenas 1D, 2D e 3D são suportados (shape = {:?})", shape));
         }
@@ -239,6 +288,12 @@ impl BasaltoInterceptor {
             shape: shape.clone(),
             strides: strides.clone(),
             radius,
+            matmul_m: None,
+            matmul_n: None,
+            matmul_k: None,
+            matmul_trans_a: None,
+            matmul_trans_b: None,
+            matmul_batch: None,
             vendor: gpu.vendor.clone(),
             arch: gpu.arch.clone(),
             driver_version: gpu.driver_version.clone(),
@@ -392,6 +447,12 @@ impl BasaltoInterceptor {
                 shape: shape.clone(),
                 strides: strides.clone(),
                 radius,
+                matmul_m: None,
+                matmul_n: None,
+                matmul_k: None,
+                matmul_trans_a: None,
+                matmul_trans_b: None,
+                matmul_batch: None,
                 vendor: gpu.vendor.clone(),
                 arch: gpu.arch.clone(),
                 driver_version: gpu.driver_version.clone(),
@@ -433,9 +494,11 @@ impl PyBasaltoInterceptor {
         job_id: Option<String>,
         device_ptr_x: usize,
         device_ptr_y: usize,
+        device_ptr_z: usize,
     ) -> PyResult<()> {
         let ptr_x = device_ptr_x as *mut c_void;
         let ptr_y = device_ptr_y as *mut c_void;
+        let ptr_z = device_ptr_z as *mut c_void;
 
         py.allow_threads(|| {
             self.inner.compile_and_execute(
@@ -446,6 +509,7 @@ impl PyBasaltoInterceptor {
                 job_id,
                 ptr_x,
                 ptr_y,
+                ptr_z,
             )
         })
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))

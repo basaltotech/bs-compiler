@@ -3,7 +3,9 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use serde_json::Value;
+
 use basalto_target_nvidia::NvidiaRuntime;
+use basalto_target_nvidia::blas::{CublasRuntime, CUBLAS_OP_N, CUBLAS_OP_T};
 use basalto_common::hardware::GpuIdentity;
 use energy_telemetry::correlator::Correlator;
 use energy_telemetry::comparator::TemporalComparator;
@@ -67,20 +69,9 @@ impl Executor {
         device_ptr_x: *mut c_void,
         device_ptr_y: *mut c_void,
     ) -> Result<()> {
-        // ================================================================
-        // TROCA DE HALOS (antes do kernel)
-        // ================================================================
         if let Some(exchanger) = &self.halo_exchanger {
             let elem_size = if dtype == "f32" || dtype == "f16" || dtype == "bf16" { 4 } else { 8 };
             let dims = shape.len();
-            let rank = exchanger.get_rank();
-            let size = exchanger.get_size();
-
-            eprintln!(
-                "[Executor] Trocando halos (rank={}/{}) shape={:?}, radius={}",
-                rank, size, shape, radius
-            );
-
             exchanger.exchange_halo_3d(
                 device_ptr_x,
                 shape[0],
@@ -94,9 +85,6 @@ impl Executor {
             )?;
         }
 
-        // ================================================================
-        // EXECUÇÃO DO KERNEL
-        // ================================================================
         let start = std::time::Instant::now();
         self.runtime
             .launch(
@@ -115,7 +103,6 @@ impl Executor {
         if let Some(hash) = kernel_hash {
             let job_id_str = job_id.unwrap_or("unknown");
             let node_id = &gpu.node_id;
-
             self.correlator.record(&hash, job_id_str, node_id, 0.0, elapsed);
             self.comparator.record_execution(&hash, op, dtype, shape, 0);
 
@@ -163,6 +150,98 @@ impl Executor {
                 };
                 let _ = sender.try_send(report);
             }
+        }
+
+        Ok(())
+    }
+
+    pub fn execute_cublas(
+        &self,
+        a_ptr: *mut c_void,
+        b_ptr: *mut c_void,
+        c_ptr: *mut c_void,
+        m: usize,
+        n: usize,
+        k: usize,
+        trans_a: bool,
+        trans_b: bool,
+        batch: usize,
+        dtype: &str,
+        kernel_hash: Option<String>,
+        job_id: Option<&str>,
+    ) -> Result<()> {
+        let cublas = CublasRuntime::new()
+            .map_err(|e| anyhow!("Falha ao carregar cuBLAS: {}", e))?;
+        let handle = cublas.create_handle()?;
+
+        let start = std::time::Instant::now();
+
+        let op_a = if trans_a { CUBLAS_OP_T } else { CUBLAS_OP_N };
+        let op_b = if trans_b { CUBLAS_OP_T } else { CUBLAS_OP_N };
+
+        let a_stride = m * k;
+        let b_stride = k * n;
+        let c_stride = m * n;
+        let elem_size = if dtype == "f32" { 4 } else { 8 };
+
+        unsafe {
+            match dtype {
+                "f32" => {
+                    let alpha: f32 = 1.0;
+                    let beta: f32 = 0.0;
+                    for i in 0..batch {
+                        let a_offset = (a_ptr as *mut u8).add(i * a_stride * elem_size);
+                        let b_offset = (b_ptr as *mut u8).add(i * b_stride * elem_size);
+                        let c_offset = (c_ptr as *mut u8).add(i * c_stride * elem_size);
+                        let status = (cublas.cublas_sgemm)(
+                            handle,
+                            op_a, op_b,
+                            m as i32, n as i32, k as i32,
+                            &alpha,
+                            a_offset as *const c_void, m as i32,
+                            b_offset as *const c_void, k as i32,
+                            &beta,
+                            c_offset as *mut c_void, m as i32,
+                        );
+                        if status != 0 {
+                            return Err(anyhow!("cublasSgemm falhou no batch {} com status {}", i, status));
+                        }
+                    }
+                }
+                "f64" => {
+                    let alpha: f64 = 1.0;
+                    let beta: f64 = 0.0;
+                    for i in 0..batch {
+                        let a_offset = (a_ptr as *mut u8).add(i * a_stride * elem_size);
+                        let b_offset = (b_ptr as *mut u8).add(i * b_stride * elem_size);
+                        let c_offset = (c_ptr as *mut u8).add(i * c_stride * elem_size);
+                        let status = (cublas.cublas_dgemm)(
+                            handle,
+                            op_a, op_b,
+                            m as i32, n as i32, k as i32,
+                            &alpha,
+                            a_offset as *const c_void, m as i32,
+                            b_offset as *const c_void, k as i32,
+                            &beta,
+                            c_offset as *mut c_void, m as i32,
+                        );
+                        if status != 0 {
+                            return Err(anyhow!("cublasDgemm falhou no batch {} com status {}", i, status));
+                        }
+                    }
+                }
+                _ => return Err(anyhow!("Tipo de dado não suportado para cuBLAS: {}", dtype)),
+            }
+        }
+
+        let elapsed = start.elapsed().as_micros() as u64;
+        let _ = cublas.destroy_handle(handle);
+
+        if let Some(hash) = kernel_hash {
+            let gpu = GpuIdentity::from_system().unwrap_or_default();
+            let job_id_str = job_id.unwrap_or("unknown");
+            self.correlator.record(&hash, job_id_str, &gpu.node_id, 0.0, elapsed);
+            self.comparator.record_execution(&hash, "matmul", &[m, k, n], 0);
         }
 
         Ok(())
@@ -289,5 +368,35 @@ pub fn execute_flir_kernel(
         job_id,
         device_ptr_x,
         device_ptr_y,
+    )
+}
+
+pub fn execute_cublas_kernel(
+    a_ptr: *mut c_void,
+    b_ptr: *mut c_void,
+    c_ptr: *mut c_void,
+    m: usize,
+    n: usize,
+    k: usize,
+    trans_a: bool,
+    trans_b: bool,
+    batch: usize,
+    dtype: &str,
+    kernel_hash: Option<String>,
+    sender: Option<mpsc::Sender<KernelExecutionReport>>,
+    profiler_sender: Option<mpsc::Sender<KernelExecutionRecord>>,
+    correlator: Arc<Correlator>,
+    comparator: Arc<TemporalComparator>,
+    job_id: Option<&str>,
+) -> Result<()> {
+    let executor = Executor::new(sender, profiler_sender, correlator, comparator, None)?;
+    executor.execute_cublas(
+        a_ptr, b_ptr, c_ptr,
+        m, n, k,
+        trans_a, trans_b,
+        batch,
+        dtype,
+        kernel_hash,
+        job_id,
     )
 }

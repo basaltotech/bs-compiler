@@ -30,7 +30,13 @@ pub struct KernelMetadata {
     pub dtype: String,
     pub shape: Vec<usize>,
     pub strides: Vec<isize>,
-    pub radius: usize, 
+    pub radius: usize,
+    pub matmul_m: Option<usize>,
+    pub matmul_n: Option<usize>,
+    pub matmul_k: Option<usize>,
+    pub matmul_trans_a: Option<bool>,
+    pub matmul_trans_b: Option<bool>,
+    pub matmul_batch: Option<usize>,
     pub vendor: String,
     pub arch: String,
     pub driver_version: String,
@@ -43,36 +49,41 @@ impl KernelMetadata {
     fn to_serialized(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
-        // operation: 32 bytes
         let mut op = [0u8; 32];
         let op_bytes = self.operation.as_bytes();
         let len = op_bytes.len().min(32);
         op[..len].copy_from_slice(&op_bytes[..len]);
         buf.extend_from_slice(&op);
 
-        // dtype: 16 bytes
         let mut dt = [0u8; 16];
         let dt_bytes = self.dtype.as_bytes();
         let len = dt_bytes.len().min(16);
         dt[..len].copy_from_slice(&dt_bytes[..len]);
         buf.extend_from_slice(&dt);
 
-        // shape
         buf.extend_from_slice(&(self.shape.len() as u64).to_le_bytes());
         for dim in &self.shape {
             buf.extend_from_slice(&(*dim as u64).to_le_bytes());
         }
 
-        // strides
         buf.extend_from_slice(&(self.strides.len() as u64).to_le_bytes());
         for stride in &self.strides {
             buf.extend_from_slice(&(*stride as i64).to_le_bytes());
         }
 
-        // radius: 8 bytes
         buf.extend_from_slice(&(self.radius as u64).to_le_bytes());
 
-        // vendor, arch, driver
+        let has_matmul = self.matmul_m.is_some();
+        buf.extend_from_slice(&[has_matmul as u8]);
+        if has_matmul {
+            buf.extend_from_slice(&self.matmul_m.unwrap_or(0).to_le_bytes());
+            buf.extend_from_slice(&self.matmul_n.unwrap_or(0).to_le_bytes());
+            buf.extend_from_slice(&self.matmul_k.unwrap_or(0).to_le_bytes());
+            buf.extend_from_slice(&[self.matmul_trans_a.unwrap_or(false) as u8]);
+            buf.extend_from_slice(&[self.matmul_trans_b.unwrap_or(false) as u8]);
+            buf.extend_from_slice(&self.matmul_batch.unwrap_or(1).to_le_bytes());
+        }
+
         let mut v = [0u8; 16];
         let v_bytes = self.vendor.as_bytes();
         let len = v_bytes.len().min(16);
@@ -91,7 +102,6 @@ impl KernelMetadata {
         dv[..len].copy_from_slice(&dv_bytes[..len]);
         buf.extend_from_slice(&dv);
 
-        // capabilities
         if let Some(caps) = &self.capabilities {
             buf.extend_from_slice(&caps.compute_capability_major.to_le_bytes());
             buf.extend_from_slice(&caps.compute_capability_minor.to_le_bytes());

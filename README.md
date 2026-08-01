@@ -1,179 +1,101 @@
-## 📁 Raiz do Projeto
+Sim, com acesso `root` é possível, e essa é exatamente a abordagem correta para um sistema que precisa lidar com a diversidade de operações que a Petrobras descreveu. O segredo não é tentar reescrever tudo do zero em LLVM, mas sim construir uma **camada de orquestração inteligente** que decide, em tempo real, qual motor usar para cada operação.
 
-| Arquivo/Diretório | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Workspace Rust (todos os crates) |
-| `Cargo.lock` | Lockfile das dependências |
-| `pyproject.toml` | Configuração do maturin (bindings Python) |
-| `.env.example` | Exemplo de variáveis de ambiente (REDIS_CACHE_URL, LOG_LEVEL) |
-| `.gitignore` | Arquivos ignorados pelo Git |
-| `README.md` | Documentação inicial |
-| `LICENSE` | Licença do projeto |
+Com `root`, você tem controle total sobre o hardware e as bibliotecas do sistema, o que permite uma estratégia em três camadas:
 
 ---
 
-## 📁 `crates/` — Núcleo em Rust
+## 🧠 A Estratégia de Três Camadas para MatMul
 
-### `basalto-common/` — Utilitários compartilhados
+### Camada 1: Deferência para Bibliotecas Otimizadas (cuBLAS/cuSPARSE)
 
-| Arquivo | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Manifesto do crate |
-| `src/lib.rs` | Ponto de entrada |
-| `src/config.rs` | Leitura de `.env` |
-| `src/error.rs` | Tipos de erro unificados |
-| `src/hardware.rs` | Detecção dinâmica via APIs (CUDA/HIP/ZE) |
-| `src/permissions.rs` | Verificação de CAP_SYS_NICE e device nodes (sem root) |
-| `src/telemetry.rs` | Helpers para envio assíncrono de métricas (base para o COUN) |
-| `src/hasher.rs` | (Nota: também presente em basalto-core) |
+Para a maioria dos casos (matrizes densas, operações BLAS padrão), a melhor estratégia é **não compilar** – é chamar a biblioteca otimizada do fabricante.
 
-### `basalto-core/` — Núcleo do compilador (FLIR + Hasher)
+*   **O que o Basalto faz hoje:** O `interceptor` compila tudo para PTX via LLVM.
+*   **O que deveria fazer:** Detectar que a operação é um `matmul` denso e, em vez de gerar PTX, chamar `cublasSgemm` (ou `cublasGemmEx` para FP16/BF16) diretamente via `libloading` [3†L6-L8].
+*   **Por que isso é melhor:** A NVIDIA investe bilhões de dólares em engenheiros para otimizar a cuBLAS. Um compilador gerando PTX do zero dificilmente vai superar o desempenho de uma biblioteca que usa Tensor Cores com instruções `mma.sync` em PTX inline [4†L6-L7], além de ter suporte a FP64 com performance otimizada em GPUs como a Blackwell [3†L17-L20]. Para matrizes esparsas (comuns em simulação de reservatórios), a chamada seria para `cusparseSpMM` [5†L27-L30].
 
-| Arquivo | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Manifesto do crate |
-| `src/lib.rs` | Ponto de entrada |
-| `src/flir_builder.rs` | Geração de FLIR a partir da AST Python |
-| `src/hasher.rs` | SHA-256 com (estrutura, tipos, shape, vendor, arch, driver_version) |
-| `src/llvm/` | Módulo LLVM |
-| `src/llvm/mod.rs` | Ponto de entrada do módulo LLVM |
-| `src/llvm/builder.rs` | Builder para IR LLVM |
-| `src/llvm/parser.rs` | Parser para IR LLVM |
-| `src/llvm/types.rs` | Definição de tipos LLVM |
+> **Com `root`, você pode:**
+> *   Carregar `libcublas.so` e `libcusparse.so` dinamicamente.
+> *   Consultar a versão da CUDA e escolher a melhor implementação (ex: cuBLAS 12.9+ tem otimizações específicas para Tensor Cores) [3†L43-L45].
+> *   Garantir que as bibliotecas estão no `LD_LIBRARY_PATH` correto.
 
-> **Observação:** Os diretórios `ir/`, `analysis/`, `transforms/` e `dialect/` são mencionados na estrutura, mas não aparecem na listagem do `src/` — podem estar vazios ou ainda não commitados.
+### Camada 2: Geração de Código Sob Medida (CUTLASS / JIT)
 
-### `basalto-gems/` — Stride View (reorganização de memória sem cópia)
+Para operações que **não** são cobertas pelas bibliotecas padrão (ex: fusão de MatMul com bias + ReLU, ou formatos de dados customizados), você pode gerar código CUDA C++ em tempo de execução usando **CUTLASS** e compilá-lo com `nvrtc` (JIT compilation).
 
-| Arquivo | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Manifesto do crate |
-| `src/lib.rs` | Ponto de entrada |
-| `src/stride_view.rs` | Reinterpretação de layout de tensores |
+*   **Como funciona:** O Basalto mantém um template de kernel CUTLASS [11†L11-L15] e preenche os parâmetros (tamanhos da matriz, tipo de dado, epílogo) dinamicamente. O código é então compilado para PTX usando `nvrtc` e carregado via `cuModuleLoadData` (exatamente como o Basalto já faz com o LLVM).
+*   **Vantagem:** Você obtém desempenho próximo ao da cuBLAS, mas com a flexibilidade de fundir operações (ex: MatMul + Bias + ReLU em um único kernel), eliminando viagens de ida e volta à memória global [3†L37-L42].
+*   **Diferencial do Basalto:** O SiliconForge JIT pode, com o tempo, aprender quais configurações de tile/warp funcionam melhor para cada formato de matriz e `shape`, criando um banco de receitas otimizadas. Com `root`, você pode até inspecionar o assembly SASS gerado para ajustar finamente os parâmetros.
 
-### `basalto-target-nvidia/` — Codegen FLIR → PTX
+### Camada 3: Compilação de Stencils (FLIR) para Operações Não Lineares
 
-| Arquivo | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Manifesto do crate |
-| `src/lib.rs` | Ponto de entrada |
-| `src/codegen.rs` | Gera PTX via LLVM |
-| `src/runtime.rs` | Chamadas CUDA para validação |
+Para operações que não são MatMul (como os stencils sísmicos que o Basalto já implementa), a abordagem de gerar LLVM IR e compilar para PTX continua sendo a correta.
 
-### `basalto-target-amd/` — Codegen FLIR → HSACO
-
-| Arquivo | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Manifesto do crate |
-| `src/lib.rs` | Ponto de entrada |
-| `src/codegen.rs` | Gera HSACO |
-| `src/runtime.rs` | Runtime para AMD |
-
-### `basalto-target-intel/` — Codegen FLIR → SPIR-V
-
-| Arquivo | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Manifesto do crate |
-| `src/lib.rs` | Ponto de entrada |
-| `src/codegen.rs` | Gera SPIR-V |
-| `src/runtime.rs` | Runtime para Intel |
-
-### `siliconforge-jit/` — Autocalibração contínua em tempo real
-
-| Arquivo | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Manifesto do crate |
-| `src/lib.rs` | Ponto de entrada |
-| `src/profiler.rs` | Roda em tokio::spawn (task assíncrona) — recalibra blocos matemáticos em background |
-
-### `basalto-tree/` — Interceptor principal (registrado no torch.compile)
-
-| Arquivo | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Depende de basalto-core, gems, targets, common |
-| `src/lib.rs` | Ponto de entrada |
-| `src/interceptor.rs` | Fluxo: raw_call → gems::stride_view() → core::hash() → cache_lookup → (compile/reuse) → executor |
-| `src/local_cache.rs` | Cache L1 (in-memory + disco local) |
-| `src/cluster_cache.rs` | Cache L2 (Redis — somente binário). Consulta/escrita oportunista, não bloqueante |
-| `src/executor.rs` | Dispara kernel na GPU local + NOTIFICA siliconforge-jit (assíncrono) |
-
-### `energy-telemetry/` — Medição de kWh e correlação (COUN)
-
-| Arquivo | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Manifesto do crate |
-| `src/lib.rs` | Ponto de entrada |
-| `src/reader.rs` | Leitura de sensores (IPMI, Redfish, API proprietária) |
-| `src/correlator.rs` | Amarra (hash, timestamp_início, timestamp_fim, kWh_delta) por execução |
-
-### `basalto-installer/` — Binário Rust para instalação segura
-
-| Arquivo | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Reutiliza basalto-common (hardware + permissions) |
-| `src/main.rs` | Detecta hardware, negocia permissões mínimas, gera configuração |
+*   **Onde entra:** O `flir_builder` atual é perfeito para stencils 1D/2D/3D. Ele não precisa ser modificado para MatMul; apenas não deve ser usado para MatMul.
 
 ---
 
-## 📁 `python/` — Bindings PyO3 (expõe o Basalto Tree para o PyTorch)
+## 🔄 Como Fica o Fluxo no `interceptor.rs`
 
-| Arquivo/Diretório | Descrição |
-| :--- | :--- |
-| `Cargo.toml` | Depende de basalto-tree |
-| `pyproject.toml` | Configuração do pacote Python |
-| `src/` | Código fonte da extensão Rust (PyO3) |
-| `basalto/` | Pacote Python |
-| `basalto/__init__.py` | Importa o interceptor do Rust |
-| `basalto/_rust.pyi` | Stubs para tipagem |
-| `basalto/compiler.py` | Wrapper que registra o backend no torch.compile() |
-| `basalto/lib.rs` | Código Rust da extensão (PyO3) |
-| `basalto/ops/` | Autotune e heurísticas (mantido em Python) |
-| `basalto/ops/__init__.py` | Inicialização do módulo ops |
-| `basalto/ops/matmul.py` | Kernel de multiplicação de matrizes |
-| `basalto/ops/attention.py` | Kernel de atenção |
-| `tests/unit/` | Testes unitários |
-| `tests/integration/` | Testes com GPU real (local) |
+Atualmente, o `compile_and_execute` sempre chama `build_flir`. A lógica precisa ser:
 
----
-
-## 📁 `deploy/` — Implantação
-
-| Arquivo/Diretório | Descrição |
-| :--- | :--- |
-| `installer/install.sh` | Bootstrap fino (bash): baixa o binário Rust, checa SO, executa o basalto-installer |
-| `redis/redis.conf` | (Opcional) Configuração do cache compartilhado |
-
----
-
-## 📁 `scripts/` — Utilitários para desenvolvimento
-
-| Arquivo | Descrição |
-| :--- | :--- |
-| `dev-setup.sh` | Script de setup para desenvolvimento |
-| `run-tests.sh` | Script para executar testes |
+```rust
+pub fn compile_and_execute(&self, op: String, ...) -> Result<()> {
+    match op.as_str() {
+        "matmul" => {
+            // 1. Se for denso e tamanho >= threshold, usa cuBLAS
+            if is_dense && m * k * n > 100_000 {
+                return self.execute_cublas(...);
+            }
+            // 2. Se for esparso, usa cuSPARSE
+            if is_sparse {
+                return self.execute_cusparse(...);
+            }
+            // 3. Se for customizado (ex: com fusão), gera CUTLASS JIT
+            return self.execute_cutlass_jit(...);
+        }
+        "stencil_1d" | "stencil_2d" | "stencil_3d" => {
+            // Fluxo atual: FLIR -> LLVM -> PTX
+        }
+        _ => { /* fallback */ }
+    }
+}
+```
 
 ---
 
-## 📁 `.github/` — CI/CD
+## 🚀 O Que o Root Permite de Forma Dinâmica e Identificada
 
-| Arquivo | Descrição |
-| :--- | :--- |
-| `workflows/ci.yml` | Lint, testes unitários (sem GPU), build wheels |
-| `workflows/integration.yml` | Testes com GPU real (self-hosted) |
+Com `root`, o Basalto pode:
 
----
-
-## 📁 `docs/` — Documentação
-
-| Arquivo | Descrição |
-| :--- | :--- |
-| `architecture.md` | Desenho arquitetural final |
-| `integration.md` | Como registrar no PyTorch |
-| `cache_protocol.md` | Especificação da chave do Redis (hash + arch + driver) |
-| `energy_telemetry.md` | Como medir kWh e faturar em COUN |
+1.  **Identificar a Arquitetura Exata:** Ler `compute_capability` via `cuDeviceGetAttribute` para saber se a GPU suporta Tensor Cores (Volta+) e qual a melhor configuração de warp (ex: `m16n8k16` para FP16 em GPUs modernas) [4†L7].
+2.  **Escolher a Melhor Biblioteca:** Carregar a versão correta da cuBLAS (ex: `libcublas.so.12` vs `libcublas.so.11`) e, para FP64, usar as novas APIs que emulam FP64 em Tensor Cores em GPUs Blackwell, garantindo performance máxima [3†L6-L8].
+3.  **Ajustar Parâmetros em Tempo Real:** O SiliconForge JIT pode, ao perceber que uma determinada configuração de tile está performando abaixo do esperado (via `nvmlDeviceGetPowerUsage` e temporização), recompilar o kernel CUTLASS com novos parâmetros e substituir o binário no cache – tudo sem intervenção manual.
+4.  **Gerenciar a Memória Compartilhada:** Com `root`, o instalador pode configurar o limite de memória compartilhada por SM (via `cuCtxSetLimit`), permitindo que kernels com tiles maiores rodem sem estouro.
+5.  **Auditar o Consumo de Energia:** A medição de kWh por operação de MatMul se torna trivial, pois você pode amostrar `nvmlDeviceGetPowerUsage` antes e depois da chamada da cuBLAS/CUTLASS, e correlacionar com o `job_id` e `node_id` – exatamente o que o COUN precisa.
 
 ---
 
-## ✅ Resumo
+## 🧩 O que Falta no Código Atual (e Como Implementar)
 
-O repositório contém **todos os crates Rust** necessários para o compilador, **bindings PyO3** para integração com Python/PyTorch, **scripts de deploy**, **CI/CD** e **documentação técnica**. A estrutura segue exatamente o desenho arquitetural descrito no `readme.md` e no `architecture.md`.
+1.  **Adicionar `execute_cublas()` no `executor.rs`:** Usar `libloading` para carregar `cublasSgemm` e chamá-la com os ponteiros de dispositivo recebidos do PyTorch.
+2.  **Adicionar `execute_cutlass_jit()`:** Integrar com a biblioteca CUTLASS (via `nvrtc`) para gerar kernels fundidos. Isso pode ser um crate separado (`basalto-gemm-jit`).
+3.  **Modificar o `interceptor.rs`:** Adicionar o `match` para `op` e rotear para a função correta.
+4.  **Expandir o `KernelMetadata`:** Incluir informações como `is_sparse`, `m`, `n`, `k`, `transpose_a`, `transpose_b` para que a chave de cache reflita corretamente a operação.
+5.  **Integrar com o SiliconForge:** O profiler deve registrar métricas específicas de MatMul (ex: TFLOPS alcançados, ocupação dos Tensor Cores) para alimentar o otimizador.
+
+---
+
+## 📊 Resumo da Arquitetura Proposta
+
+| Operação | Motor | Responsabilidade do Basalto |
+| :--- | :--- | :--- |
+| MatMul Denso (FP32/FP64) | cuBLAS | Chamar a biblioteca correta, medir energia e tempo. |
+| MatMul Denso (FP16/BF16) | cuBLAS (Tensor Cores) | Garantir que a cuBLAS use Tensor Cores [0†L5-L7]. |
+| MatMul Esparsa | cuSPARSE | Chamar `cusparseSpMM` para matrizes com muitos zeros [5†L27-L30]. |
+| MatMul + Fusão (Bias/ReLU) | CUTLASS JIT | Gerar kernel customizado com `nvrtc` e carregar via `cuModuleLoadData`. |
+| Stencils Sísmicos | FLIR → LLVM → PTX | Fluxo já implementado (com halos, MPI, etc.). |
+
+Com essa arquitetura, o Basalto se torna um **orquestrador inteligente** que usa a ferramenta certa para cada trabalho, em vez de tentar ser um compilador universal. O acesso `root` garante que ele possa fazer isso de forma dinâmica, identificada e otimizada para cada GPU do cluster.
+
+Para começar, sugiro implementar a **Camada 1 (cuBLAS)** primeiro, pois é a mais simples e trará o maior ganho imediato de performance para MatMul. Posso gerar o código completo para o `execute_cublas` no `executor.rs` se desejar.
