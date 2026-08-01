@@ -8,11 +8,29 @@ def basalto_backend(gm: torch.fx.GraphModule, example_inputs):
         return gm
 
     op = "stencil"
-    for node in gm.graph.nodes:
+    fused_op = None
+    nodes = list(gm.graph.nodes)
+    for i, node in enumerate(nodes):
         if node.op == "call_function":
             target_str = str(node.target)
             if "matmul" in target_str or "mm" in target_str or "bmm" in target_str:
                 op = "matmul"
+                for j in range(i+1, min(i+5, len(nodes))):
+                    nxt = nodes[j]
+                    if nxt.op == "call_function":
+                        tgt = str(nxt.target)
+                        if "bias" in tgt:
+                            fused_op = "bias"
+                        elif "relu" in tgt and fused_op == "bias":
+                            fused_op = "bias_relu"
+                        elif "gelu" in tgt and fused_op == "bias":
+                            fused_op = "bias_gelu"
+                        elif fused_op is None and "relu" in tgt:
+                            fused_op = "relu"
+                        elif fused_op is None and "gelu" in tgt:
+                            fused_op = "gelu"
+                        elif fused_op is None and "scale" in tgt:
+                            fused_op = "scale"
                 break
             elif "attention" in target_str:
                 op = "attention"
@@ -36,6 +54,8 @@ def basalto_backend(gm: torch.fx.GraphModule, example_inputs):
             k = a.shape[1]
             n = b.shape[1]
         c = torch.empty((batch, m, n), device=a.device, dtype=a.dtype)
+        if fused_op:
+            op = f"matmul_{fused_op}"
         shape = [batch, m, k, n]
         dtype = str(a.dtype).split('.')[-1]
         strides = [0, 0, 0, 0]

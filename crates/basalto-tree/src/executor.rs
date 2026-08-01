@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use serde_json::Value;
 
@@ -12,6 +13,7 @@ use energy_telemetry::correlator::Correlator;
 use energy_telemetry::comparator::TemporalComparator;
 use siliconforge_jit::profiler::KernelExecutionRecord;
 use basalto_communication::HaloExchanger;
+use basalto_communication::cuda::CUDA_MEMCPY_DEVICE_TO_HOST;
 
 #[cfg(feature = "cutlass")]
 use basalto_gemm_jit::fused_kernel::execute_fused_gemm;
@@ -103,7 +105,7 @@ impl Executor {
         }
 
         let energy_before_mj = self.sample_energy_mj().unwrap_or(0);
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         self.runtime
             .launch(
@@ -117,7 +119,6 @@ impl Executor {
             .map_err(|e| anyhow!("Erro ao lançar kernel: {}", e))?;
 
         let elapsed = start.elapsed().as_micros() as u64;
-
         let energy_after_mj = self.sample_energy_mj().unwrap_or(0);
         let delta_joules = (energy_after_mj - energy_before_mj) as f64 / 1000.0;
         let delta_kwh = delta_joules / 3_600_000.0;
@@ -207,39 +208,44 @@ impl Executor {
             _ => return Err(anyhow!("Validação não implementada para {}", op)),
         };
 
-        let mut gpu_result_cpu = vec![0u8; result_len * elem_size];
+        let cuda = basalto_communication::CudaRuntime::new()?;
+        let pinned_ptr = unsafe { cuda.malloc_host(result_len * elem_size)? };
+
         unsafe {
-            let cuda = basalto_communication::CudaRuntime::new()?;
             cuda.memcpy(
-                gpu_result_cpu.as_mut_ptr() as *mut c_void,
+                pinned_ptr,
                 gpu_result_ptr,
-                gpu_result_cpu.len(),
-                basalto_communication::cuda::CUDA_MEMCPY_DEVICE_TO_HOST,
+                result_len * elem_size,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
             )?;
         }
 
-        let cpu_result: Vec<f64> = match op {
-            "stencil_1d" => {
-                vec![0.0; result_len]
-            }
-            _ => vec![0.0; result_len],
+        let gpu_vals: Vec<f64> = {
+            let slice = unsafe {
+                std::slice::from_raw_parts(
+                    pinned_ptr as *const u8,
+                    result_len * elem_size,
+                )
+            };
+            slice
+                .chunks_exact(elem_size)
+                .map(|chunk| {
+                    if dtype == "f32" {
+                        f32::from_ne_bytes(chunk.try_into().unwrap()) as f64
+                    } else {
+                        f64::from_ne_bytes(chunk.try_into().unwrap())
+                    }
+                })
+                .collect()
         };
 
-        let gpu_vals: Vec<f64> = gpu_result_cpu
-            .chunks_exact(elem_size)
-            .map(|chunk| {
-                if dtype == "f32" {
-                    f32::from_ne_bytes(chunk.try_into().unwrap()) as f64
-                } else {
-                    f64::from_ne_bytes(chunk.try_into().unwrap())
-                }
-            })
-            .collect();
+        let cpu_result: Vec<f64> = vec![0.0; result_len];
 
         for (i, (gv, cv)) in gpu_vals.iter().zip(cpu_result.iter()).enumerate() {
             let diff = (gv - cv).abs();
             let tolerance = atol + rtol * cv.abs();
             if diff > tolerance {
+                unsafe { cuda.free_host(pinned_ptr)?; }
                 return Err(anyhow!(
                     "Validação falhou no índice {}: GPU={:.6e}, CPU={:.6e}, diff={:.6e}, tol={:.6e}",
                     i, gv, cv, diff, tolerance
@@ -247,6 +253,7 @@ impl Executor {
             }
         }
 
+        unsafe { cuda.free_host(pinned_ptr)?; }
         eprintln!("[Validator] Validação numérica passou ({} elementos)", result_len);
         Ok(())
     }
@@ -270,11 +277,9 @@ impl Executor {
             .map_err(|e| anyhow!("Falha ao carregar cuBLAS: {}", e))?;
         let handle = cublas.create_handle()?;
 
-        let start = std::time::Instant::now();
-
+        let start = Instant::now();
         let op_a = if trans_a { CUBLAS_OP_T } else { CUBLAS_OP_N };
         let op_b = if trans_b { CUBLAS_OP_T } else { CUBLAS_OP_N };
-
         let a_stride = m * k;
         let b_stride = k * n;
         let c_stride = m * n;
@@ -361,8 +366,7 @@ impl Executor {
         kernel_hash: Option<String>,
         job_id: Option<&str>,
     ) -> Result<()> {
-        let start = std::time::Instant::now();
-
+        let start = Instant::now();
         let ptx = execute_fused_gemm(
             a_ptr, b_ptr, c_ptr,
             m, n, k,
@@ -372,7 +376,6 @@ impl Executor {
             fused_op,
             arch,
         )?;
-
         let elapsed = start.elapsed().as_micros() as u64;
 
         if let Some(hash) = kernel_hash {
@@ -528,33 +531,15 @@ pub fn execute_cublas_kernel(
     job_id: Option<&str>,
 ) -> Result<()> {
     let executor = Executor::new(sender, profiler_sender, correlator, comparator, None)?;
-
-    let energy_before_mj = executor.sample_energy_mj().unwrap_or(0);
-    let start = std::time::Instant::now();
-
     executor.execute_cublas(
         a_ptr, b_ptr, c_ptr,
         m, n, k,
         trans_a, trans_b,
         batch,
         dtype,
-        kernel_hash.clone(),
+        kernel_hash,
         job_id,
-    )?;
-
-    let elapsed = start.elapsed().as_micros() as u64;
-    let energy_after_mj = executor.sample_energy_mj().unwrap_or(0);
-    let delta_joules = (energy_after_mj - energy_before_mj) as f64 / 1000.0;
-    let delta_kwh = delta_joules / 3_600_000.0;
-
-    if let Some(hash) = kernel_hash {
-        let gpu = GpuIdentity::from_system().unwrap_or_default();
-        let job_id_str = job_id.unwrap_or("unknown");
-        executor.correlator.record(&hash, job_id_str, &gpu.node_id, delta_kwh, elapsed);
-        executor.comparator.record_execution(&hash, "matmul", &[m, k, n], 0);
-    }
-
-    Ok(())
+    )
 }
 
 #[cfg(feature = "cutlass")]
@@ -579,10 +564,6 @@ pub fn execute_fused_gemm_kernel(
     job_id: Option<&str>,
 ) -> Result<()> {
     let executor = Executor::new(sender, profiler_sender, correlator, comparator, None)?;
-
-    let energy_before_mj = executor.sample_energy_mj().unwrap_or(0);
-    let start = std::time::Instant::now();
-
     executor.execute_fused_gemm(
         a_ptr, b_ptr, c_ptr,
         m, n, k,
@@ -591,21 +572,7 @@ pub fn execute_fused_gemm_kernel(
         dtype,
         fused_op,
         arch,
-        kernel_hash.clone(),
+        kernel_hash,
         job_id,
-    )?;
-
-    let elapsed = start.elapsed().as_micros() as u64;
-    let energy_after_mj = executor.sample_energy_mj().unwrap_or(0);
-    let delta_joules = (energy_after_mj - energy_before_mj) as f64 / 1000.0;
-    let delta_kwh = delta_joules / 3_600_000.0;
-
-    if let Some(hash) = kernel_hash {
-        let gpu = GpuIdentity::from_system().unwrap_or_default();
-        let job_id_str = job_id.unwrap_or("unknown");
-        executor.correlator.record(&hash, job_id_str, &gpu.node_id, delta_kwh, elapsed);
-        executor.comparator.record_execution(&hash, "fused_gemm", &[m, k, n], 0);
-    }
-
-    Ok(())
+    )
 }

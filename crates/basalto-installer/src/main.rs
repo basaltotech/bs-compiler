@@ -3,6 +3,7 @@ use basalto_common::hardware::GpuIdentity;
 use basalto_common::permissions::{ensure_root_or_die, setup_udev_rules, add_user_to_group, detect_nvidia_group};
 use std::fs;
 use std::path::Path;
+use rand::RngCore;
 
 fn main() -> Result<()> {
     ensure_root_or_die()?;
@@ -39,7 +40,6 @@ fn main() -> Result<()> {
 
     let secret_path = "/etc/basalto/secret.key";
     if !Path::new(secret_path).exists() {
-        use rand::RngCore;
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
         fs::write(secret_path, &key)?;

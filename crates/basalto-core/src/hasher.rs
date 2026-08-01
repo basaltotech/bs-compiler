@@ -4,24 +4,28 @@ use serde::{Serialize, Deserialize};
 use basalto_common::hardware::{DeviceCapabilities};
 use std::sync::OnceLock;
 
-static SECRET_KEY: OnceLock<[u8; 32]> = OnceLock::new();
-
-pub fn init_secret_key(seed: &[u8]) {
+fn load_secret_key() -> [u8; 32] {
+    let path = "/etc/basalto/secret.key";
+    if let Ok(mut f) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut key = [0u8; 32];
+        if f.read_exact(&mut key).is_ok() {
+            return key;
+        }
+    }
     let mut key = [0u8; 32];
-    let len = seed.len().min(32);
-    key[..len].copy_from_slice(&seed[..len]);
-    let _ = SECRET_KEY.set(key);
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        f.read_exact(&mut key).ok();
+    }
+    let _ = std::fs::create_dir_all("/etc/basalto");
+    let _ = std::fs::write(path, &key);
+    key
 }
 
 fn secret_key() -> &'static [u8; 32] {
-    SECRET_KEY.get_or_init(|| {
-        let mut key = [0u8; 32];
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            use std::io::Read;
-            f.read_exact(&mut key).ok();
-        }
-        key
-    })
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    KEY.get_or_init(load_secret_key)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +52,6 @@ pub struct KernelMetadata {
 impl KernelMetadata {
     fn to_serialized(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-
         let mut op = [0u8; 32];
         let op_bytes = self.operation.as_bytes();
         let len = op_bytes.len().min(32);

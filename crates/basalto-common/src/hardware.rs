@@ -57,7 +57,7 @@ impl DeviceCapabilities {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuIdentity {
     pub vendor: String,
     pub arch: String,
@@ -103,15 +103,12 @@ fn detect_vendor() -> String {
     "unknown".to_string()
 }
 
-/// Detecta a arquitetura usando CUDA API (mais confiável) ou fallback para nvidia-smi.
 fn detect_arch(vendor: &str) -> Result<String, BasaltoError> {
     match vendor {
         "nvidia" => {
-            // Tenta via CUDA API primeiro
             if let Some(arch) = detect_arch_via_cuda(0) {
                 return Ok(arch);
             }
-            // Fallback: nvidia-smi
             let output = Command::new("nvidia-smi")
                 .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
                 .output()
@@ -129,7 +126,6 @@ fn detect_arch(vendor: &str) -> Result<String, BasaltoError> {
     }
 }
 
-/// Lê a compute capability diretamente via CUDA Driver API.
 fn detect_arch_via_cuda(device_index: i32) -> Option<String> {
     unsafe {
         let lib = Library::new("libcuda.so.1").ok()?;

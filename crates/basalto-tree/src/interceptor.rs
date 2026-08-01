@@ -551,7 +551,6 @@ impl PyBasaltoInterceptor {
         device_ptr_x: usize,
         device_ptr_y: usize,
         device_ptr_z: usize,
-        custom_coeffs: Option<Vec<f64>>,
     ) -> PyResult<()> {
         let ptr_x = device_ptr_x as *mut c_void;
         let ptr_y = device_ptr_y as *mut c_void;
@@ -567,7 +566,7 @@ impl PyBasaltoInterceptor {
                 ptr_x,
                 ptr_y,
                 ptr_z,
-                custom_coeffs,
+                None,
             )
         })
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
