@@ -5,7 +5,7 @@
 
 **Basalto** é um compilador JIT (Just‑In‑Time) para GPUs que acelera simulações científicas e modelos de IA com um único código‑fonte, independente do fabricante do hardware.  
 
-Inspirado na rocha vulcânica que se forma ao resfriar rapidamente, o Basalto transforma código de alto nível em kernels nativos e otimizados para NVIDIA, AMD e Intel (atualmente com suporte completo para NVIDIA , AMD e INTEL).
+Inspirado na rocha vulcânica que se forma ao resfriar rapidamente, o Basalto transforma código de alto nível em kernels nativos e otimizados para NVIDIA, AMD e Intel (atualmente com suporte completo para NVIDIA).
 ---
 
 ## ✨ Características
