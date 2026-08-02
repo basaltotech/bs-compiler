@@ -1,7 +1,3 @@
-Aqui está um `README.md` mais moderno, com uma arquitetura visualmente mais clara e um diagrama Mermaid redesenhado para caber todo o texto sem cortes. Também ajustei a formatação para torná-lo mais direto e legível.
-
----
-
 # Basalto – Um compilador para o desempenho máximo de GPUs
 
 [![CI](https://github.com/basaltotech/bs-compiler/actions/workflows/ci.yml/badge.svg)](https://github.com/basaltotech/bs-compiler/actions/workflows/ci.yml)
