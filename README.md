@@ -35,7 +35,7 @@ flowchart TD
     B --> C[Interceptor<br>basalto-tree]
     C --> D{Decisão da operação}
     D -->|Stencil| E[FLIR → LLVM → PTX<br>basalto-core]
-    D -->|MatMul| F[cuBLAS / CUTLASS JIT<br>basalto-target-nvidia / basalto-gemm-jit]
+    D -->|MatMul| F[cuBLAS / CUTLASS JIT<br>basalto-target-nvidia / basalto-gems-jit]
     E --> G[GPU NVIDIA]
     F --> G
     C -.->|Métricas| H[SiliconForge JIT + Energy Telemetry]
